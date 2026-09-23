@@ -1,0 +1,149 @@
+{
+  "debug_port": 9222,
+  "check_interval_sec": 300,
+  "neis_guard_sec": 20,
+  "autostart": {
+    "keeper": true,
+    "monitor": false
+  },
+  "tts_enabled": false,
+  "neis_open": {
+    "school": "○○중학교",
+    "atpt": "B10",
+    "scode": ""
+  },
+  "deadline_lead_days": 3,
+  "deadlines": [
+    {
+      "name": "예: 성적 마감",
+      "date": "2026-12-31"
+    }
+  ],
+  "paths": {
+    "ahk_script": "sen_login_keepalive.ahk",
+    "ahk_exe": "",
+    "chrome_exe": "",
+    "alim_exe": "C:\\알림장\\ALIM.EXE",
+    "comci_dir": "C:\\Program Files (x86)\\알림이\\dat\\tmp"
+  },
+  "urls": {
+    "업무포털": "https://sen.eduptl.kr",
+    "나이스": "https://sen.neis.go.kr/jsp/main.jsp",
+    "K-에듀파인": "https://klef.sen.go.kr",
+    "E알리미": "https://www.ealimi.com/Document/SignListReady"
+  },
+  "keepalive_targets": [
+    {
+      "name": "나이스(NEIS)",
+      "match": "sen.neis.go.kr",
+      "mode": "neis"
+    },
+    {
+      "name": "K-에듀파인",
+      "match": "klef.sen.go.kr",
+      "mode": "edupine"
+    }
+  ],
+  "monitor_interval_sec": 180,
+  "monitors": [
+    {
+      "name": "나이스 승인사항",
+      "match": "sen.eduptl.kr",
+      "type": "neis",
+      "refresh": true
+    },
+    {
+      "name": "K-에듀파인 결재/공람",
+      "match": "klef.sen.go.kr",
+      "type": "edufine"
+    },
+    {
+      "name": "E알리미 결재서류",
+      "match": "ealimi.com",
+      "type": "ealimi"
+    }
+  ],
+  "extend_keywords": [
+    "연장",
+    "세션연장",
+    "시간연장",
+    "세션 연장",
+    "시간 연장",
+    "연장하기",
+    "계속사용",
+    "계속 사용",
+    "시간연장하기"
+  ],
+  "leave_reason_presets": {
+    "연가": "개인 사유로 연가를 신청합니다.",
+    "병가": "진료 및 안정이 필요하여 병가를 신청합니다.",
+    "조퇴": "개인 사정으로 조퇴를 신청합니다.",
+    "지각": "부득이한 사유로 지각을 신청합니다.",
+    "외출": "업무/개인 사유로 외출을 신청합니다.",
+    "공가": "공무 수행 관련 사유로 공가를 신청합니다.",
+    "출장": "업무 수행을 위해 출장을 신청합니다."
+  },
+  "peek_keywords": [
+    "미결",
+    "결재",
+    "수신",
+    "대기",
+    "처리",
+    "반려",
+    "공람"
+  ],
+  "doclist_sources": [
+    {
+      "name": "K-에듀파인",
+      "match": "klef.sen.go.kr"
+    },
+    {
+      "name": "E알리미",
+      "match": "ealimi.com"
+    },
+    {
+      "name": "나이스",
+      "match": "sen.neis.go.kr"
+    }
+  ],
+  "attendance": {
+    "match": "sen.neis.go.kr",
+    "deadline": "15:00",
+    "class_re": "(\\d학년\\s*\\d{1,2}반|\\d{1,2}\\s*-\\s*\\d{1,2})",
+    "unclosed_words": [
+      "미마감",
+      "미입력",
+      "미처리",
+      "미완료"
+    ],
+    "closed_words": [
+      "마감",
+      "완료",
+      "처리완료",
+      "입력완료"
+    ]
+  },
+  "classroom_call": {
+    "topic": "myschool-call-CHANGEME",
+    "sender": "",
+    "class_counts": {
+      "1": 6,
+      "2": 8,
+      "3": 6
+    },
+    "send_mode": "lan_first",
+    "lan_port": 8787,
+    "lan_key": "",
+    "boards": {},
+    "display_url": ""
+  },
+  "alim_db": {
+    "host": "",
+    "port": 3308,
+    "user": "",
+    "password": "",
+    "db": "alim",
+    "charset": "euckr"
+  },
+  "secrets_note": "비밀번호류는 이 파일에 넣지 말고 환경변수나 별도 파일을 쓰세요. 이 파일은 예시입니다."
+}

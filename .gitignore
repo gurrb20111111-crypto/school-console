@@ -1,0 +1,20 @@
+# 개인 설정·상태 (절대 올리지 않는다)
+school_console_config.json
+school_console_state.json
+*.local.json
+토픽.txt
+반.txt
+
+# 학교 내부 데이터
+MYSET.DBF
+AUTOBACK/
+DOWN/
+TEMP/
+BACKUP/
+
+# 빌드 산출물
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
