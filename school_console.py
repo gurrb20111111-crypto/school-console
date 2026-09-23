@@ -2158,7 +2158,7 @@ def read_alim_from_db(date8, cfg_db):
         try:
             conn = pymysql.connect(
                 host=host, port=p,
-                user=c.get("user", "root"), password=str(c.get("password", "")),
+                user=c.get("user", ""), password=str(c.get("password", "")),
                 database=c.get("db", "alim"), charset=c.get("charset", "euckr"),
                 connect_timeout=int(c.get("timeout", 4)), read_timeout=6, write_timeout=6)
             break
