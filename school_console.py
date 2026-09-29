@@ -38,7 +38,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 
 try:
     from websocket import create_connection  # pip install websocket-client
@@ -2415,6 +2415,97 @@ def do_send_lan(ip, port, text, key="", cid=None):
         return False, str(e)
 
 
+def do_ping(base, pid):
+    """연결 확인: <base>-ping 채널로 핑 한 번. 칠판 앱(v1.4+)은 화면에 아무것도 안 띄우고
+       <base>-reply 로 {"t":"pong","pid",...} 만 돌려준다. (ok, detail)"""
+    if not base:
+        return False, "채널(base)이 설정되지 않았습니다"
+    url = "https://ntfy.sh/" + urllib.parse.quote(base + "-ping", safe="")
+    body = json.dumps({"t": "ping", "pid": pid, "at": int(time.time())}).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return (200 <= getattr(r, "status", 200) < 300), "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def norm_mac(s):
+    """'aa:bb:cc:dd:ee:ff' / 'AA-BB-…' / 'aabbccddeeff' → 'AA:BB:CC:DD:EE:FF'. 못 알아보면 ''."""
+    h = re.sub(r"[^0-9A-Fa-f]", "", str(s or ""))
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2)).upper() if len(h) == 12 else ""
+
+
+def send_wol(mac, ip=None):
+    """Wake-on-LAN '매직 패킷'(FF×6 + MAC×16)을 보낸다. 칠판이 '랜으로 켜기'를 지원하고
+       그 설정이 켜져 있고, 이 PC와 같은 네트워크 구간에 있을 때 대기 상태의 칠판이 켜진다.
+       반환: 보낸 횟수(0이면 MAC 형식 오류)."""
+    import socket
+    mac = norm_mac(mac)
+    if not mac:
+        return 0
+    pkt = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "")) * 16
+    targets = [("255.255.255.255", 9), ("255.255.255.255", 7)]
+    if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        targets += [(ip.rsplit(".", 1)[0] + ".255", 9), (ip, 9)]      # 그 칠판 대역의 방송 + 직접
+    sent = 0
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sk.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    for _ in range(3):                                            # 잘 유실되니 몇 번 반복
+        for t in targets:
+            try:
+                sk.sendto(pkt, t)
+                sent += 1
+            except Exception:
+                pass
+        time.sleep(0.2)
+    sk.close()
+    return sent
+
+
+def arp_mac(ip):
+    """윈도우 ARP 표에서 그 IP의 MAC 주소를 찾는다(같은 네트워크 구간이고 방금 통신했을 때만 나옴)."""
+    if not ip:
+        return ""
+    try:
+        raw = subprocess.run(["arp", "-a", ip], capture_output=True, timeout=5,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        out = raw.decode("cp949", "ignore")      # 한글 윈도우 arp 출력은 cp949
+        m = re.search(re.escape(ip) + r"\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})", out)
+        return norm_mac(m.group(1)) if m else ""
+    except Exception:
+        return ""
+
+
+def do_wake_relay(base, macs, wid):
+    """켜져 있는 칠판(앱 v1.5+)들에게 '이 MAC 들을 너희 구간에서 깨워 달라'고 부탁한다.
+       교무실 PC와 칠판이 다른 네트워크 구간이라 PC의 Wake-on-LAN 신호가 안 닿기 때문.
+       핑 채널로 보내므로 칠판 화면엔 아무것도 뜨지 않는다. (ok, detail)"""
+    if not base or not macs:
+        return False, "대상 없음"
+    url = "https://ntfy.sh/" + urllib.parse.quote(base + "-ping", safe="")
+    body = json.dumps({"t": "wake", "wid": wid, "macs": list(macs), "at": int(time.time())}).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return (200 <= getattr(r, "status", 200) < 300), "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def probe_lan(ip, port=8787, timeout=2.0):
+    """학교망 직접: 칠판 앱의 상태 주소(GET /)를 조회. 살아 있으면 정보 dict, 아니면 None.
+       (앱 v1.0부터 있던 기능이라 구버전 칠판도 학교망으로는 확인된다)"""
+    if not ip:
+        return None
+    try:
+        req = urllib.request.Request("http://{}:{}/".format(ip, int(port or 8787)))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
 def discover_boards(port=8787, wait=1.5):
     """학교망에 있는 '교실 호출' 앱(전자칠판)을 UDP 브로드캐스트로 찾는다.
        반환: [{"ip","class","label","room","port"}, ...]  (같은 망/서브넷에 있을 때만 찾아짐)"""
@@ -2481,6 +2572,8 @@ class CallReplyListener(threading.Thread):
             url = "https://ntfy.sh/" + urllib.parse.quote(self.topic, safe="") + "/json"
             if self.last_id:
                 url += "?since=" + urllib.parse.quote(self.last_id)
+            else:
+                url += "?since=12h"      # 처음 켤 때: 오늘 수신확인·답장을 보낸 반을 기억해 두기 위해
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "school-console-reply"})
                 with urllib.request.urlopen(req, timeout=90, context=self._ctx()) as r:
@@ -2499,7 +2592,7 @@ class CallReplyListener(threading.Thread):
                             body = json.loads(d.get("message", ""))
                         except Exception:
                             continue
-                        if isinstance(body, dict) and body.get("cid"):
+                        if isinstance(body, dict) and (body.get("cid") or body.get("t") == "pong"):
                             body["_time"] = d.get("time") or int(time.time())
                             self.ui_post("call_reply", body)
             except Exception as e:
@@ -3873,7 +3966,7 @@ class ConsoleApp:
             ttk.Label(gr, text="{}학년".format(g), width=7).pack(side="left")
             for c in range(1, int(counts[g]) + 1):
                 key = "{}-{}".format(g, c)
-                b = tk.Button(gr, text="{}반".format(c), width=4, relief="raised", cursor="hand2",
+                b = tk.Button(gr, text="{}반".format(c), width=5, relief="raised", cursor="hand2",
                               command=lambda k=key: self._call_toggle_class(k))
                 b.pack(side="left", padx=2)
                 self.call_class_btns[key] = b
@@ -3903,7 +3996,10 @@ class ConsoleApp:
                                   bg="#c0392b", fg="white", font=("Malgun Gothic", 12, "bold"),
                                   relief="flat", cursor="hand2", padx=20, pady=8)
         self.call_btn.pack(side="left")
-        ttk.Button(btnrow, text="교실 설치 도우미…", command=self.open_call_setup).pack(side="left", padx=(10, 0))
+        ttk.Button(btnrow, text="📡 연결 확인", command=self.check_boards).pack(side="left", padx=(10, 0))
+        # ⚡ 전원 켜기(Wake-on-LAN)는 2026-09-28 수업 중 칠판이 꺼지는 현상 보고로 버튼을 뺌.
+        # 원인이 확인되기 전까지 수업 중 칠판 전원에 영향을 줄 수 있는 기능은 노출하지 않는다.
+        ttk.Button(btnrow, text="교실 설치 도우미…", command=self.open_call_setup).pack(side="left", padx=(6, 0))
         self.call_status = tk.StringVar(value="")
         ttk.Label(btnrow, textvariable=self.call_status).pack(side="left", padx=12)
 
@@ -3965,10 +4061,23 @@ class ConsoleApp:
             self.call_sel.add(key)
         self._call_refresh_sel()
 
+    CALL_MARK = {"on": "●", "old": "◐", "off": "○"}
+
     def _call_refresh_sel(self):
+        online = getattr(self, "call_online", {})
         for key, b in self.call_class_btns.items():
-            on = key in self.call_sel
-            b.config(bg=("#c0392b" if on else "SystemButtonFace"), fg=("white" if on else "black"))
+            st = online.get(key, {}).get("state")
+            b.config(text="{}반{}".format(key.split("-")[1], self.CALL_MARK.get(st, "")))
+            if key in self.call_sel:
+                b.config(bg="#c0392b", fg="white")            # 선택됨(기호로 상태는 계속 보임)
+            elif st == "on":
+                b.config(bg="#d9f2df", fg="#1b5e20")          # ● 지금 받을 수 있음
+            elif st == "old":
+                b.config(bg="#fff4cc", fg="#8a6d00")          # ◐ 핑엔 무응답이지만 오늘 수신 기록 있음(구버전 추정)
+            elif st == "off":
+                b.config(bg="#ececec", fg="#a0a0a0")          # ○ 응답 없음
+            else:
+                b.config(bg="SystemButtonFace", fg="black")   # 아직 확인 안 함
         if self.call_sel:
             names = ", ".join(self._class_label(k) for k in sorted(self.call_sel,
                               key=lambda k: (int(k.split("-")[0]), int(k.split("-")[1]))))
@@ -4113,7 +4222,12 @@ class ConsoleApp:
                 pass
 
     def _on_call_reply(self, b):
-        """교실에서 돌아온 신호 처리. ack=화면에 떴음, reply=교실에서 누른 답장 버튼."""
+        """교실에서 돌아온 신호 처리. ack=화면에 떴음, reply=교실에서 누른 답장 버튼, pong=연결확인 응답."""
+        self._note_seen(b)
+        if b.get("t") == "pong":
+            self._mark_board(b.get("pid"), b.get("cls"), "인터넷", b.get("ver"), b.get("ip"), b.get("port"),
+                             b.get("mac"))
+            return
         cid, cls = b.get("cid"), (b.get("cls") or "").strip()
         kind = b.get("t", "ack")
         at = datetime.fromtimestamp(b.get("_time") or time.time()).strftime("%H:%M")
@@ -4142,6 +4256,194 @@ class ConsoleApp:
                 self.root.bell()
             except Exception:
                 pass
+
+    # ---- 연결 확인: 메시지를 띄우지 않고 각 반 칠판이 지금 받을 수 있는 상태인지 확인 ----
+    CALL_PING_SEC = 10     # 이 시간 안에 응답이 없으면 '응답 없음'
+
+    def check_boards(self):
+        """두 길로 동시에 확인한다.
+           ① 인터넷: <base>-ping 에 핑 한 번 → 칠판 앱(v1.4+)이 조용히 pong 을 돌려줌
+           ② 학교망: 등록된 칠판 주소로 상태 조회 + 브로드캐스트 찾기(구버전 앱도 응답)
+           어느 쪽이든 응답이 오면 '연결됨'. 칠판 화면에는 아무것도 뜨지 않는다."""
+        cc = self.cfg.get("classroom_call", {})
+        base = cc.get("topic", "")
+        port = cc.get("lan_port", 8787)
+        boards = dict(cc.get("boards", {}) or {})
+        pid = new_call_id()
+        self.call_ping = {"pid": pid, "at": time.time(), "done": False, "ip_changed": False}
+        self.call_online = {}
+        self._call_refresh_sel()
+        self.call_status.set("📡 연결 확인 중… ({}초)".format(self.CALL_PING_SEC))
+
+        def work():
+            ok, detail = do_ping(base, pid)
+            if not ok:
+                self.ui_post("log", "[연결 확인] 인터넷 핑 실패: {}".format(detail))
+            # 학교망: 등록된 칠판 하나씩 조회
+            def probe(cls, b):
+                info = probe_lan(b.get("ip"), b.get("port", port))
+                if info and (info.get("class") or cls):
+                    self.ui_post("call_presence", {"pid": pid, "cls": info.get("class") or cls, "via": "학교망",
+                                                   "ver": info.get("ver"), "ip": b.get("ip"), "port": b.get("port", port),
+                                                   "mac": arp_mac(b.get("ip"))})
+            ts = [threading.Thread(target=probe, args=(k, v), daemon=True) for k, v in boards.items()]
+            for t in ts:
+                t.start()
+            # 학교망: 브로드캐스트로 새로 켜진 칠판도 찾기
+            for info in discover_boards(port=port, wait=2.5):
+                if info.get("class"):
+                    self.ui_post("call_presence", {"pid": pid, "cls": info.get("class"), "via": "학교망",
+                                                   "ver": info.get("ver"), "ip": info.get("ip"),
+                                                   "port": info.get("port", port), "mac": arp_mac(info.get("ip"))})
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(self.CALL_PING_SEC * 1000, lambda p=pid: self._finish_board_check(p))
+
+    WOL_BOOT_SEC = 90     # 전원 신호 뒤 칠판 부팅 + 앱 자동 시작까지 기다리는 시간
+
+    def power_on_selected(self):
+        """고른 반 칠판에 '랜으로 켜기(Wake-on-LAN)' 신호를 보내고, 부팅 시간 뒤 자동으로 연결 확인.
+           칠판이 대기 상태(전원 버튼으로 끈 상태)이고 '랜으로 켜기'가 켜져 있어야 동작한다.
+           전원 코드가 빠졌거나 차단기가 내려간 상태는 어떤 방법으로도 못 켠다."""
+        if not self.call_sel:
+            self.call_status.set("⚡ 켤 반을 먼저 고르세요")
+            return
+        cc = self.cfg.setdefault("classroom_call", {})
+        boards = cc.setdefault("boards", {})
+        order = sorted(self.call_sel, key=lambda k: (int(k.split("-")[0]), int(k.split("-")[1])))
+        sent, skipped = [], []
+        for cls in order:
+            b = boards.get(cls) or {}
+            mac = norm_mac(b.get("mac"))
+            if not mac:
+                raw = simpledialog.askstring(
+                    "칠판 MAC 주소",
+                    "{} 칠판의 MAC 주소를 입력하세요.\n"
+                    "(칠판 설정 → 정보/네트워크에 있는 12자리, 예: 00:1A:2B:3C:4D:5E)\n"
+                    "칠판 앱이 v1.5 이상이면 [연결 확인] 한 번으로 자동 등록되니 입력할 필요가 없습니다.".format(
+                        self._class_label(cls)),
+                    parent=self.root)
+                mac = norm_mac(raw)
+                if not mac:
+                    skipped.append(cls)
+                    continue
+                boards[cls] = dict(b, mac=mac)
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+            n = send_wol(mac, b.get("ip"))                 # ① 이 PC에서 직접(같은 구간일 때만 닿음)
+            (sent if n else skipped).append(cls)
+        if sent:                                             # ② 켜져 있는 칠판들이 같은 구간에서 대신 쏨
+            macs = [norm_mac((boards.get(k) or {}).get("mac")) for k in sent]
+            ok, detail = do_wake_relay(cc.get("topic", ""), [m for m in macs if m], new_call_id())
+            if not ok:
+                self.log("⚡ 칠판 중계 요청 실패: {}".format(detail))
+        now = datetime.now().strftime("%H:%M")
+        if sent:
+            self.log("[{}] ⚡ 전원 켜기 신호 보냄: {}".format(now, ", ".join(self._class_label(k) for k in sent)))
+            self.call_status.set("⚡ {}반에 전원 켜기 신호 보냄 — {}초 뒤 자동으로 연결 확인합니다".format(
+                len(sent), self.WOL_BOOT_SEC))
+            self.root.after(self.WOL_BOOT_SEC * 1000, self.check_boards)
+        if skipped:
+            self.log("[{}] ⚡ MAC 주소가 없어 건너뜀: {}".format(now, ", ".join(self._class_label(k) for k in skipped)))
+            if not sent:
+                self.call_status.set("⚡ MAC 주소가 없어 신호를 보내지 못했습니다")
+
+    def _mark_board(self, pid, cls, via, ver=None, ip=None, port=None, mac=None):
+        ping = getattr(self, "call_ping", None)
+        cls = (cls or "").strip()
+        if not ping or pid != ping["pid"] or not cls:
+            return                                    # 다른(이전) 확인에 대한 늦은 응답
+        rec = self.call_online.setdefault(cls, {"state": "on", "via": set()})
+        rec["state"] = "on"
+        rec["via"].add(via)
+        rec["ver"] = ver or rec.get("ver")
+        # 응답에 실린 칠판 주소로 학교망 직접 전송용 등록을 최신화
+        if ip and ip != "주소없음":
+            boards = self.cfg.setdefault("classroom_call", {}).setdefault("boards", {})
+            cur = boards.get(cls) or {}
+            mac = norm_mac(mac) or cur.get("mac", "")
+            if cur.get("ip") != ip or cur.get("mac", "") != mac:
+                boards[cls] = dict(cur, ip=ip, port=port or cur.get("port", 8787), room=cur.get("room", ""), mac=mac)
+                ping["ip_changed"] = True
+        self._call_refresh_sel()
+        n = sum(1 for r in self.call_online.values() if r["state"] == "on")
+        if not ping["done"]:
+            self.call_status.set("📡 연결 확인 중… 응답 {}반".format(n))
+        else:
+            self._board_check_summary()               # 마감 후 늦게 온 응답도 반영
+
+    def _finish_board_check(self, pid):
+        ping = getattr(self, "call_ping", None)
+        if not ping or pid != ping["pid"]:
+            return
+        ping["done"] = True
+        counts = self.cfg.get("classroom_call", {}).get("class_counts", {"1": 6, "2": 8, "3": 6})
+        seen = self.state.get("call_last_seen", {})
+        now = time.time()
+        for g in counts:
+            for c in range(1, int(counts[g]) + 1):
+                key = "{}-{}".format(g, c)
+                if key in self.call_online:
+                    continue
+                last = seen.get(key) or {}
+                recent = now - float(last.get("at") or 0) <= self.CALL_SEEN_SEC
+                if recent and not self._is_v14(last.get("ver")):
+                    # 핑엔 무응답이지만 최근에 실제 호출을 받았던 반 = 핑을 못 듣는 구버전 앱일 가능성이 큼
+                    self.call_online[key] = {"state": "old", "via": set(), "at": last.get("at")}
+                else:
+                    self.call_online[key] = {"state": "off", "via": set(), "at": last.get("at") if recent else None}
+        if ping.get("ip_changed"):
+            try:
+                save_config(self.cfg)
+            except Exception:
+                pass
+        self._call_refresh_sel()
+        self._board_check_summary(log=True)
+
+    CALL_SEEN_SEC = 12 * 3600     # 이 시간 안에 수신확인·답장·응답이 온 반은 '최근 살아 있었음'
+
+    @staticmethod
+    def _is_v14(ver):
+        try:
+            major, minor = (str(ver or "0.0").split(".") + ["0"])[:2]
+            return (int(major), int(minor)) >= (1, 4)
+        except Exception:
+            return False          # 'html'·'pc' 같은 비(非)앱 수신기는 버전 비교 대상이 아님
+
+    def _note_seen(self, b):
+        """수신확인(ack)·답장(reply)·연결응답(pong) 모두 '그 반 칠판이 그때 살아 있었다'는 증거다."""
+        cls = (b.get("cls") or "").strip()
+        if not cls:
+            return
+        seen = self.state.setdefault("call_last_seen", {})
+        at = float(b.get("_time") or time.time())
+        cur = seen.get(cls) or {}
+        if at >= float(cur.get("at") or 0):
+            # 수신확인·답장엔 버전이 없으므로, 한 번이라도 pong 으로 알게 된 버전은 유지한다
+            seen[cls] = {"at": at, "ver": b.get("ver") or cur.get("ver", ""), "t": b.get("t"), "via": b.get("via")}
+            save_state(self.state)
+
+    def _board_check_summary(self, log=False):
+        order = lambda k: (int(k.split("-")[0]), int(k.split("-")[1]))
+        pick = lambda st: sorted([k for k, r in self.call_online.items() if r["state"] == st], key=order)
+        on, old, off = pick("on"), pick("old"), pick("off")
+        now = datetime.now().strftime("%H:%M")
+        self.call_status.set("📡 {} 확인 — ● 연결됨 {} · ◐ 구버전 추정 {} · ○ 응답 없음 {}".format(
+            now, len(on), len(old), len(off)))
+        if not log:
+            return
+        lab = lambda ks: ", ".join(self._class_label(k) for k in ks)
+        hm = lambda ts: datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "?"
+        self.log("[{}] 연결 확인 — ● 연결됨({}): {}".format(now, len(on), lab(on) or "없음"))
+        if old:
+            self.log("   ◐ 구버전 추정({}): {} — 핑엔 무응답이지만 최근 실제 호출을 받았던 반입니다. "
+                     "앱을 v1.4로 올리면 ●로 확인됩니다.".format(
+                         len(old), ", ".join("{}({} 수신)".format(self._class_label(k), hm(self.call_online[k].get("at")))
+                                              for k in old)))
+        if off:
+            self.log("   ○ 응답 없음({}): {} — 칠판 꺼짐·앱 꺼짐·인터넷 끊김이거나, 최근 12시간 수신 기록이 없는 반입니다.".format(
+                len(off), lab(off)))
 
     def _start_call_listener(self):
         base = self.cfg.get("classroom_call", {}).get("topic", "")
@@ -4394,6 +4696,9 @@ class ConsoleApp:
                     self._show_call_result(payload)
                 elif kind == "call_reply":
                     self._on_call_reply(payload)
+                elif kind == "call_presence":
+                    self._mark_board(payload.get("pid"), payload.get("cls"), payload.get("via"),
+                                     payload.get("ver"), payload.get("ip"), payload.get("port"), payload.get("mac"))
                 elif kind == "approval":
                     self._show_approval(payload)
                 elif kind == "alim":
