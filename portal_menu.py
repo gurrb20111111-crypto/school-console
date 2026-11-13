@@ -14,7 +14,7 @@
 
 성공 → 0, 실패 → 1  (AHK는 실패 시 예전 좌표 클릭으로 폴백)
 """
-import sys, os, json, time, subprocess, urllib.request
+import sys, os, json, time, subprocess, urllib.request, urllib.parse
 
 try:
     from websocket import create_connection
@@ -98,6 +98,41 @@ def send(ws, mid, method, params):
     return {}
 
 
+def clean_old_neis(ws, sso_url):
+    """나이스를 새로 열기 전에 '예전 나이스 접속 흔적'을 지운다 (2026-11-13 추가).
+
+    왜: 업무포털을 다시 로그인하면 서버 쪽 나이스 '세션 등록 정보'가 지워진다. 그런데 크롬에
+        예전 나이스 쿠키가 남아 있으면 나이스가 정식 로그인 절차(SSO)를 건너뛰고 그 옛 접속을
+        그대로 쓴다 → 화면은 뜨는데 등록 정보가 없어서 세션 연장이 "N"으로 거절되고,
+        얼마 뒤 "세션 DB정보가 없어 시스템을 종료합니다"로 끝난다.
+    그래서: ① 나이스 쿠키를 지워 매번 정식 SSO 로그인을 거치게 하고
+            ② 죽은 접속을 물고 있는 옛 나이스 탭은 닫는다."""
+    host = urllib.parse.urlparse(sso_url).netloc.split(":")[0]
+    if not host:
+        return
+    try:
+        res = send(ws, 20, "Network.getCookies", {"urls": ["https://%s/" % host]})
+        n = 0
+        for c in res.get("cookies", []):
+            # WMONID 는 접속과 무관한 서버 구분용이라 둔다. 상위 도메인(neis.go.kr) 쿠키도 건드리지 않는다.
+            if c.get("name") == "WMONID" or (c.get("domain") or "").lstrip(".") != host:
+                continue
+            n += 1
+            send(ws, 20 + n, "Network.deleteCookies",
+                 {"name": c["name"], "domain": c["domain"], "path": c.get("path", "/")})
+        print("옛 나이스 쿠키 %d개 정리" % n)
+    except Exception as e:
+        print("쿠키 정리 건너뜀:", e)
+    try:
+        data = json.loads(urllib.request.urlopen("http://127.0.0.1:%d/json/list" % PORT, timeout=5).read().decode())
+        for pg in data:
+            if pg.get("type") == "page" and host in (pg.get("url") or ""):
+                urllib.request.urlopen("http://127.0.0.1:%d/json/close/%s" % (PORT, pg["id"]), timeout=5).read()
+                print("옛 나이스 탭 닫음")
+    except Exception as e:
+        print("옛 탭 닫기 건너뜀:", e)
+
+
 def main():
     page = None
     for _ in range(6):
@@ -118,6 +153,8 @@ def main():
         info = json.loads(res.get("result", {}).get("value", "") or "{}")
         url = info.get("url", "")
         if url.startswith("http"):
+            if TARGET in ("nais", "neis"):
+                clean_old_neis(ws, url)      # 옛 접속 흔적을 지워 정식 SSO 로그인을 거치게 함
             subprocess.Popen([find_chrome(), "--user-data-dir=" + PROFILE, url])
             print("SSO URL 직접 열기:", info.get("text"))
             sys.exit(0)

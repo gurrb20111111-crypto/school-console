@@ -31,6 +31,17 @@ ClickWinRel(win, rx, ry) {
 }
 
 
+; 디버그 크롬에 '그 주소의 탭이 다 열릴 때까지' 기다린다 (wait_tab.py, 최대 maxSec초).
+;  정해진 초만 쉬고 다음 창을 열면, PC가 느린 날엔 앞 창이 다 뜨기도 전에 다음 창이 열렸다.
+WaitTab(match, maxSec := 20) {
+    script := A_ScriptDir "\wait_tab.py"
+    if FileExist(script) {
+        try RunWait(Format('python "{}" "{}" {}', script, match, maxSec), , "Hide")
+    } else {
+        Sleep(2500)
+    }
+}
+
 ^!e:: {
     evpnUrl    := "https://evpn.sen.go.kr/custom/index.html"
     portalUrl  := "https://sen.eduptl.kr"
@@ -186,7 +197,9 @@ ClickWinRel(win, rx, ry) {
         if !ClickWinRel("업무포털", relNice[1], relNice[2])
             ClickAbs(mL + offNice[1], mT + offNice[2])
     }
-    Sleep(2000)
+    ; 나이스가 '다 열릴 때까지' 기다린 뒤, 화면이 자리 잡도록 한 박자 더 쉰다
+    WaitTab("neis.go.kr/jsp/main.jsp", 20)
+    Sleep(1500)
 
     ; -----------------------------
     ; 8. K-에듀파인  (URL 직접 열기 — 인증서 로그인 후 SSO 자동 연결)
@@ -195,7 +208,8 @@ ClickWinRel(win, rx, ry) {
     ; -----------------------------
     Sleep(1000)
     Run(Format('"{}" {} "{}"', chromePath, flags, "https://klef.sen.go.kr"))
-    Sleep(2000)
+    WaitTab("klef.sen.go.kr/keris_ui", 15)     ; 에듀파인이 다 열릴 때까지
+    Sleep(1000)
 
     ; -----------------------------
     ; 8-1. E알리미  (같은 디버그 크롬에 탭으로 오픈 → 프로필에 로그인 유지)
@@ -203,7 +217,9 @@ ClickWinRel(win, rx, ry) {
     ; -----------------------------
     Sleep(1500)
     Run(Format('"{}" {} "{}"', chromePath, flags, "https://www.ealimi.com/Document/SignListReady"))
-    Sleep(2000)
+    ; E알리미가 '다 열릴 때까지' 기다린 뒤 한 박자 더 쉬고 나서 콘솔을 띄운다
+    WaitTab("ealimi.com", 15)
+    Sleep(1500)
 
     ; =============================================
     ; 9. ★ 통합 콘솔 자동 시작 (세션 유지 포함) ★

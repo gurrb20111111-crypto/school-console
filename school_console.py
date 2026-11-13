@@ -76,6 +76,10 @@ DEFAULT_CONFIG = {
     #  (실측: reload는 카운트다운을 60분으로 복구+로그인 유지. 팝업 클릭보다 안정적.)
     #  neis_reload_below_min: 백그라운드 탭에서 잔여 이 분 이하면 리로드(작업 방해 없음).
     #  neis_reload_critical_min: 전면 탭이어도 이 분 이하면 리로드(로그아웃보다 리로드가 나음). 0=끔.
+    # 나이스 접속시간이 이 분 이하로 남으면 '화면 새로고침 없이' 60분으로 되돌린다([연장] 버튼과 같은 동작). 0=끔.
+    "neis_extend_below_min": 30,
+    # 나이스가 "이 접속은 무효"라고 답하면(포털 재로그인 뒤 흔함) 옛 쿠키를 지우고 SSO로 자동 재접속. False=끔.
+    "neis_auto_reenter": True,
     "neis_reload_below_min": 12,
     "neis_reload_critical_min": 4,
     # 콘솔이 켜질 때 자동으로 시작할 기능 (AHK가 콘솔을 띄우면 원클릭 운영)
@@ -755,9 +759,32 @@ def do_read_approval_path(port, match):
 class CDP:
     """탭 1개의 DevTools 웹소켓과 통신하는 최소 클라이언트."""
 
-    def __init__(self, ws_url):
+    def __init__(self, ws_url, auto_accept_dialogs=True):
         self.ws = create_connection(ws_url, timeout=8)
         self._id = 0
+        # 알림창(alert/confirm)이 뜨면 — True : 바로 [확인] (잠깐 붙었다 떼는 작업용, 예전 동작)
+        #                              False: 건드리지 않고 문구만 기억 (탭 지킴이용)
+        self.auto_accept_dialogs = auto_accept_dialogs
+        self.dialog = None        # 지금 떠 있는 알림창 문구 (auto_accept_dialogs=False 일 때만 추적)
+        self.crashed = False
+
+    def _note(self, data):
+        """응답이 아닌 '이벤트'를 처리한다. 이벤트였으면 True."""
+        m = data.get("method")
+        if m == "Page.javascriptDialogOpening":
+            if self.auto_accept_dialogs:
+                self.ws.send(json.dumps({"id": 999990, "method": "Page.handleJavaScriptDialog",
+                                         "params": {"accept": True}}))
+            else:
+                self.dialog = (((data.get("params") or {}).get("message")) or "").strip() or "(내용 없음)"
+            return True
+        if m == "Page.javascriptDialogClosed":
+            self.dialog = None
+            return True
+        if m == "Inspector.targetCrashed":
+            self.crashed = True
+            return True
+        return False
 
     def send(self, method, params=None, await_promise=False, timeout=15):
         self._id += 1
@@ -774,13 +801,26 @@ class CDP:
                 data = json.loads(self.ws.recv())
             except Exception:
                 break
-            if data.get("method") == "Page.javascriptDialogOpening":
-                self.ws.send(json.dumps({"id": 999990, "method": "Page.handleJavaScriptDialog",
-                                         "params": {"accept": True}}))
+            if self._note(data):
                 continue
             if data.get("id") == mid:
                 return data.get("result", {})
         return {}
+
+    def alive(self, timeout=4):
+        """탭 안의 스크립트가 실제로 대답하는가? (크롬이 탭을 버렸거나 얼렸으면 False)
+           ※ 버려진(discard) 탭은 목록에도 있고 연결도 되지만, 스크립트만 영영 대답이 없다."""
+        try:
+            self.ws.settimeout(timeout)
+            res = self.send("Runtime.evaluate", {"expression": "1+1"}, timeout=timeout)
+            return (res.get("result") or {}).get("value") == 2
+        except Exception:
+            return False
+        finally:
+            try:
+                self.ws.settimeout(8)
+            except Exception:
+                pass
 
     def pump(self, seconds):
         end = time.time() + seconds
@@ -830,10 +870,20 @@ def find_target_page(port, match):
     return None
 
 
+# 나이스가 "이 접속은 무효"라고 답했을 때 붙이는 표식 (세션 유지 워커가 보고 자동 재접속)
+NEIS_ZOMBIE_TAG = "나이스가 이 접속을 무효 처리"
+
+
 def _keep_neis(cdp):
     """나이스: /sessionExtension.do 직접 호출 + 연장창 자동확인. (state, detail).
-    - eval이 빈손(=탭이 얼어 스크립트 무응답) → 자동 새로고침으로 되살림.
-    - 스크립트는 도는데 서버가 'N'/빈응답(=세션 만료) → 재로그인 안내(새로고침은 소용없음)."""
+
+    ★ 응답의 뜻 (나이스 화면 소스 Index.clx.js 의 session_extention() 에서 확인, 2026-11-13)
+       "Y"   = 서버에 내 '세션 등록 정보'가 있음(정상)
+       그 외 = 등록 정보가 없음 → 나이스 스스로 "세션 DB정보가 없어 시스템을 종료합니다"를 띄운다.
+               시간 초과가 아니라 '같은 사용자가 다른 세션으로 로그인'했을 때 생긴다.
+               대표적인 경우: 업무포털을 로그아웃·재로그인한 뒤, 예전 나이스 쿠키가 남은 채
+               나이스를 다시 열면 화면은 멀쩡한데 등록 정보만 지워진 '빈 껍데기 접속'이 된다.
+               → 새로고침으로는 못 고친다. 옛 쿠키를 지우고 SSO로 다시 들어가야 한다(neis_reenter)."""
     raw = None
     info = {}
     try:
@@ -841,7 +891,7 @@ def _keep_neis(cdp):
         info = json.loads(raw or "{}")
     except Exception:
         info = {}
-    responsive = isinstance(info, dict) and ("ok" in info)   # JS가 실제로 값을 돌려줬는가(=탭이 안 얼었나)
+    responsive = isinstance(info, dict) and ("ok" in info)   # JS가 실제로 값을 돌려줬는가
 
     extra = ""
     if info.get("dialog") and info.get("btnX"):
@@ -850,22 +900,19 @@ def _keep_neis(cdp):
         extra = " · 연장창 자동확인"
 
     if info.get("ok"):
-        # 주의: 이건 '서버 세션' 유지 성공일 뿐. 나이스 클라 60분 카운트다운은
-        # 연장 팝업 클릭(관제 가드)으로만 리셋되므로 그건 별개로 감시된다.
+        # 주의: 이건 '서버 세션' 유지 성공일 뿐. 화면의 60분 카운트다운은 감시자(NeisGuardWorker)가 따로 챙긴다.
         return ("정상", "서버세션 유지 OK (sessionExtension.do=Y)" + extra)
 
-    # ---- 경고 상황 ----
     if not responsive:
-        # 탭이 얼음(스크립트 무응답) → 새로고침으로 되살림(세션 살아있으면 다음 주기에 '정상')
-        try:
-            cdp.send("Page.reload", {"ignoreCache": False})   # 렌더러가 굳어도 브라우저가 처리
-            return ("경고", "나이스 탭 무응답(얼음) → 자동 새로고침함")
-        except Exception:
-            return ("경고", "나이스 탭 무응답(얼음) — 새로고침 필요")
+        # 탭은 살아 있는데(do_keepalive가 먼저 확인) 이번 요청만 답을 못 받음 → 다음 주기에 다시
+        return ("경고", "나이스 응답을 받지 못함(일시적일 수 있음) — 다음 주기에 다시 확인")
 
-    # 스크립트는 도는데 서버가 'Y'를 안 줌(N/빈응답) = 세션 만료. 새로고침으론 못 살림 → 재로그인.
     body = (info.get("body") or "").strip().strip('"')
-    return ("경고", "나이스 서버세션 만료(응답:{}) - ① '로그인 자동화 실행'으로 재로그인 필요".format(body or "없음"))
+    if body.startswith("ERR"):
+        return ("경고", "나이스 서버에 닿지 못함({}) — 네트워크 확인".format(body[:40]))
+    if len(body) > 8:      # 'N' 이 아니라 로그인 화면(HTML)이 돌아온 경우 = 서버 세션 자체가 끝남
+        return ("경고", NEIS_ZOMBIE_TAG + "함(로그인 화면 응답) — 서버 세션이 끝남")
+    return ("경고", NEIS_ZOMBIE_TAG + "함(응답:{}) — 포털 재로그인·다른 곳 로그인으로 세션 등록이 지워짐".format(body or "없음"))
 
 
 def _keep_edupine(cdp):
@@ -878,7 +925,13 @@ def _keep_edupine(cdp):
     before = info.get("timer", "")
     x, y = info.get("x"), info.get("y")
     if not x:
-        return ("실패", "'연장' 버튼 못 찾음 (에듀파인 탭/로그인 확인)")
+        # 탭은 대답하는데(do_keepalive가 먼저 확인) 버튼이 없다 = 메인 화면이 아니거나 로그아웃된 것
+        where = ""
+        try:
+            where = (cdp.eval_value("location.pathname") or "")[:40]
+        except Exception:
+            pass
+        return ("실패", "'연장' 버튼이 화면에 없음 — 에듀파인 메인이 아니거나 로그아웃됨 ({})".format(where or "?"))
     cdp.trusted_click(x, y)
     time.sleep(1.0)
     after = ""
@@ -919,9 +972,15 @@ def do_keepalive(port, target):
         return ("오류", "webSocket 주소 없음")
     cdp = CDP(ws_url)
     try:
-        cdp.send("Page.enable")
         # ★ 핵심: 백그라운드로 얼어붙은 탭을 깨운다 (없으면 타이머/연장이 멈춰 있음)
-        cdp.send("Page.setWebLifecycleState", {"state": "active"})
+        cdp.send("Page.setWebLifecycleState", {"state": "active"}, timeout=5)
+        # ★ 그래도 대답이 없으면 크롬이 탭을 '버린(discard)' 것 (메모리 부족 때 흔함, 2026-11-13 실측).
+        #    깨우기로는 안 돌아오고 새로고침해야 한다 → 탭 지킴이(TabAnchorWorker)에게 맡긴다.
+        if not cdp.alive():
+            _poke_anchor()
+            nm = target.get("name", match) if isinstance(target, dict) else match
+            return ("경고", "{} 탭이 멈춰 있음(크롬이 탭을 재웠거나 버림) → 되살리는 중".format(nm))
+        cdp.send("Page.enable")
         # ★ 실측(2026-07-07): setWebLifecycleState만으론 배경탭 타이머가 분당 1회로 throttle됨.
         #   포커스 에뮬레이션을 켜야 나이스 카운트다운/연장팝업 타이머가 정상속도로 돈다.
         try:
@@ -977,6 +1036,27 @@ NEIS_REMAIN_JS = r"""
 """
 
 
+# 나이스 접속시간(60분 카운트다운)을 '화면 새로고침 없이' 처음으로 되돌린다.
+#  · 나이스 메인 앱(app/com/main/Index)이 내보내는 setSessionTimerInit() 을 부른다.
+#    = 10분 남았을 때 뜨는 "연장하시겠습니까?"에서 [연장]을 누른 것과 똑같은 동작(setSessionTimer 재시작).
+#  · 새로고침과 달리 작성 중이던 화면이 날아가지 않는다. (2026-11-13 실측: 47분 → 60분)
+NEIS_EXTEND_JS = r"""
+(function(){
+  try {
+    var apps = cpr.core.Platform.INSTANCE.getAllRunningAppInstances();
+    for (var i = 0; i < apps.length; i++) {
+      var a = apps[i];
+      if (a && a.app && /app\/com\/main\/Index$/.test(a.app.id) && a.hasAppMethod('setSessionTimerInit')) {
+        a.callAppMethod('setSessionTimerInit');
+        return 'ok';
+      }
+    }
+    return 'nomethod';
+  } catch (e) { return 'err:' + e; }
+})()
+"""
+
+
 def _neis_remain_min(remain):
     """'N분M초' → 남은 분(float). 파싱 실패 시 None."""
     m = re.match(r"(\d+)분(\d+)초", (remain or "").replace(" ", ""))
@@ -985,10 +1065,11 @@ def _neis_remain_min(remain):
     return int(m.group(1)) + int(m.group(2)) / 60.0
 
 
-def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_min=0):
-    """나이스 탭 유지 + 임박 시 리로드로 세션 리셋(확실) + 연장 팝업 자동확인(부차). dict 반환.
-       reload_below_min : 백그라운드 탭에서 잔여 이 분 이하면 Page.reload로 리셋(60분 복구·로그인 유지, 실측).
-       critical_min     : 전면 탭이어도 이 분 이하면 리로드(로그아웃 임박이라 리로드가 덜 손해)."""
+def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_min=0, extend_below_min=0):
+    """나이스 탭 유지 + 접속시간 연장 + 연장 팝업 자동확인(부차). dict 반환.
+       extend_below_min : 잔여 이 분 이하면 '새로고침 없이' 접속시간을 처음으로 되돌림(1순위, 작업 안 날아감).
+       reload_below_min : (연장이 안 될 때만) 백그라운드 탭에서 잔여 이 분 이하면 Page.reload로 리셋.
+       critical_min     : (연장이 안 될 때만) 전면 탭이어도 이 분 이하면 리로드."""
     page = find_target_page(port, match)
     if not page:
         return {"ok": False, "reason": "탭없음"}
@@ -997,6 +1078,10 @@ def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_m
         return {"ok": False, "reason": "no ws"}
     cdp = CDP(ws_url)
     try:
+        cdp.send("Page.setWebLifecycleState", {"state": "active"}, timeout=5)  # freeze 방지
+        if not cdp.alive():
+            # 크롬이 탭을 버렸거나 얼림 → 잔여시간을 읽을 수 없다. 탭 지킴이가 새로고침으로 되살린다.
+            return {"ok": False, "reason": "무응답"}
         cdp.send("Page.enable")
         # ★ 백그라운드 여부는 포커스 에뮬레이션 켜기 '전에' 읽어야 함(에뮬 켜면 visible로 뒤바뀜)
         hidden = False
@@ -1004,8 +1089,7 @@ def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_m
             hidden = bool(cdp.eval_value("document.hidden"))
         except Exception:
             hidden = False
-        cdp.send("Page.setWebLifecycleState", {"state": "active"})  # freeze 방지
-        # ★ 배경탭 타이머 throttle 해제(실측: 이것만이 카운트다운/팝업을 정상속도로 돌림)
+        # ★ 배경탭에서는 화면 글자가 다시 그려지지 않아 잔여시간이 '옛 값'으로 읽힌다 → 포커스 에뮬로 갱신시킴
         try:
             cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
         except Exception:
@@ -1016,7 +1100,22 @@ def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_m
         except Exception:
             remain = ""
         rmin = _neis_remain_min(remain)
-        # ★★ 확실한 세션 리셋: 잔여가 임박하면 페이지 리로드 → 카운트다운 60분 복구(로그인 유지, 실측 검증).
+        # ★★ 1순위: 새로고침 없이 접속시간 연장 (나이스의 [연장] 버튼과 같은 동작)
+        if rmin is not None and extend_below_min and rmin <= extend_below_min:
+            try:
+                if cdp.eval_value(NEIS_EXTEND_JS) == "ok":
+                    after, amin = "", None
+                    for _ in range(4):               # 화면 글자가 바뀔 때까지 잠깐 기다림
+                        time.sleep(0.7)
+                        after = cdp.eval_value(NEIS_REMAIN_JS) or ""
+                        amin = _neis_remain_min(after)
+                        if amin is not None and amin > rmin + 1:
+                            return {"ok": True, "popup": False, "extended": True,
+                                    "remain": remain, "after": after, "hidden": hidden}
+            except Exception:
+                pass
+            # 연장이 확인되지 않으면 아래 '새로고침' 방식으로 넘어간다
+        # ★★ 2순위(예비): 잔여가 임박하면 페이지 리로드 → 카운트다운 60분 복구(로그인 유지, 실측 검증).
         #    작업 방해 방지를 위해 백그라운드일 때만(또는 아주 임박 critical이면 전면이어도) 리로드.
         if rmin is not None and (
                 (reload_below_min and rmin <= reload_below_min and hidden)
@@ -1049,6 +1148,86 @@ def do_neis_guard(port, match, capture_path=None, reload_below_min=0, critical_m
         return {"ok": False, "reason": str(e)}
     finally:
         cdp.close()
+
+
+# 업무포털 상단 [나이스] 메뉴의 id 에 들어 있는 SSO 주소(…/cmc_fcm_lg01_000.do?data=토큰)
+NEIS_SSO_URL_JS = r"""
+(function(){
+  function strip(s){ return (s || '').replace(/[\[\]\s\-]/g, ''); }
+  var c = document.querySelectorAll('a.menuBtn');
+  for (var i = 0; i < c.length; i++) {
+    if (strip(c[i].innerText) === '나이스' && (c[i].id || '').indexOf('http') === 0) return c[i].id;
+  }
+  return '';
+})()
+"""
+
+
+def neis_session_ok(port, match="neis.go.kr"):
+    """열려 있는 나이스 탭의 접속이 유효한가(sessionExtension.do=Y). 탭이 없거나 멈췄으면 False."""
+    page = find_target_page(port, match)
+    if not page or not page.get("webSocketDebuggerUrl"):
+        return False
+    cdp = CDP(page["webSocketDebuggerUrl"])
+    try:
+        if not cdp.alive():
+            return False
+        info = json.loads(cdp.eval_value(NEIS_KEEPALIVE_JS, await_promise=True) or "{}")
+        return bool(info.get("ok"))
+    except Exception:
+        return False
+    finally:
+        cdp.close()
+
+
+def neis_reenter(port, chrome=None, portal_match="eduptl.kr"):
+    """나이스 '깨끗한 재접속'. (ok, detail)
+       ① 업무포털을 새로 읽어 최신 SSO 주소를 얻고  ② 예전 나이스 접속 쿠키를 지운 뒤
+       ③ 나이스 탭(없으면 새 탭)을 그 SSO 주소로 보낸다.
+       ②가 핵심: 쿠키가 남아 있으면 나이스가 정식 로그인 절차를 건너뛰고 '등록 정보 없는 옛 접속'을
+       그대로 써서, 화면은 떠도 곧 "세션 DB정보가 없어 시스템을 종료합니다"로 끝난다(2026-11-13 규명)."""
+    portal = find_target_page(port, portal_match)
+    if not portal or not portal.get("webSocketDebuggerUrl"):
+        return (False, "업무포털 탭이 없음 — ① 로그인 자동화 실행이 필요합니다")
+    url = ""
+    cdp = CDP(portal["webSocketDebuggerUrl"])
+    try:
+        # 포털 화면이 오래됐으면 주소 속 토큰이 낡았을 수 있다 → 새로 읽는다(버려진 탭도 이때 되살아남)
+        cdp.send("Page.reload", {"ignoreCache": False}, timeout=5)
+        deadline = time.time() + 15
+        while time.time() < deadline and not url.startswith("http"):
+            time.sleep(1.2)
+            try:
+                url = cdp.eval_value(NEIS_SSO_URL_JS) or ""
+            except Exception:
+                url = ""
+        if not url.startswith("http"):
+            return (False, "업무포털 로그인이 풀려 있음 — ① 로그인 자동화 실행이 필요합니다")
+        host = urllib.parse.urlparse(url).netloc.split(":")[0]
+        # 예전 나이스 접속 쿠키 삭제 (WMONID 는 접속과 무관한 서버 구분용이라 둔다)
+        try:
+            cks = cdp.send("Network.getCookies", {"urls": ["https://" + host + "/"]}).get("cookies", [])
+            for c in cks:
+                if c.get("name") == "WMONID" or (c.get("domain") or "").lstrip(".") != host:
+                    continue
+                cdp.send("Network.deleteCookies", {"name": c["name"], "domain": c["domain"],
+                                                   "path": c.get("path", "/")})
+        except Exception:
+            pass
+    finally:
+        cdp.close()
+    neis = find_target_page(port, host)
+    if neis and neis.get("webSocketDebuggerUrl"):
+        c2 = CDP(neis["webSocketDebuggerUrl"])
+        try:
+            c2.send("Page.navigate", {"url": url}, timeout=5)   # 브라우저가 처리 → 탭이 멈춰 있어도 됨
+        finally:
+            c2.close()
+        return (True, "나이스 탭을 SSO로 다시 접속시킴")
+    if chrome and PROFILE_DIR:
+        subprocess.Popen([chrome, "--user-data-dir=" + PROFILE_DIR, url])
+        return (True, "나이스를 SSO로 새 탭에 열었음")
+    return (False, "나이스 탭이 없고 크롬 경로도 못 찾음")
 
 
 def do_read_monitor(port, mon):
@@ -1740,6 +1919,191 @@ def save_state(state):
 # ============================================================
 #  세션 유지 백그라운드 워커
 # ============================================================
+# ============================================================
+#  탭 지킴이 — 세션 유지 대상 탭이 '멈추지 않게' 지키고, 멈추면 되살린다
+# ============================================================
+#  왜 필요한가 (2026-11-13 규명):
+#    PC 메모리가 모자라면 크롬은 안 보는 탭을 '버린다(discard)'. 버려진 탭은 목록에도 있고
+#    연결도 되지만 스크립트가 영영 대답하지 않는다. 그 사이 콘솔은 연장 버튼도, 남은 시간도
+#    읽지 못해서 세션이 그대로 끝났다. (사용자가 그 탭을 누르면 크롬이 다시 불러와 '갑자기 되는' 것)
+#    크롬 실행 옵션(얼림 방지 4종)은 '얼림'만 막고 '버림'은 못 막는다.
+#  하는 일:
+#    ① 대상 탭마다 CDP 연결을 '계속' 붙여 둔다 → 디버거가 붙어 있는 탭은 크롬이 버리는 대상에서 빠진다.
+#    ② 탭 안에 Web Lock 을 쥐여 둔다 → Web Lock 을 쥔 페이지는 크롬이 얼리지 않는다(크롬 공식 예외).
+#    ③ 15초마다 대답하는지 확인 → 두 번 연속 대답이 없으면 새로고침으로 되살리고, 바로 세션 갱신을 다시 시킨다.
+#       (알림창이 떠서 멈춘 것이면 건드리지 않고 알려만 준다. 방금까지 보고 있던 탭은 90초를 더 기다린다.)
+ANCHOR_JS = r"""
+(function(){
+  try {
+    if (!window.__scKeep && navigator.locks && navigator.locks.request) {
+      window.__scKeep = 1;
+      navigator.locks.request('school-console-keepalive', function(){ return new Promise(function(){}); });
+    }
+  } catch (e) {}
+  return document.visibilityState;
+})()
+"""
+
+TAB_ANCHOR = None      # 실행 중인 탭 지킴이(있으면). 갱신 쪽에서 '지금 봐 달라'고 깨울 때 쓴다.
+
+
+def _poke_anchor():
+    a = TAB_ANCHOR
+    if a is not None:
+        try:
+            a.poke()
+        except Exception:
+            pass
+
+
+class TabAnchorWorker(threading.Thread):
+    PING_SEC = 15
+
+    def __init__(self, port, targets, ui_post, on_revived=None):
+        super().__init__(daemon=True)
+        self.port = port
+        self.targets = [t for t in targets if isinstance(t, dict) and t.get("match")]
+        self.ui_post = ui_post
+        self.on_revived = on_revived
+        self._st = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+
+    # ---- 바깥에서 부르는 것 ----
+    def poke(self):
+        self._wake.set()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    # ---- 내부 ----
+    def _log(self, msg):
+        self.ui_post("log", "[{}] {}".format(datetime.now().strftime("%H:%M:%S"), msg))
+
+    def _drop(self, st):
+        c = st.get("cdp")
+        st["cdp"] = None
+        st["id"] = None
+        if c is not None:
+            c.close()
+
+    def _attach(self, st, page):
+        cdp = CDP(page["webSocketDebuggerUrl"], auto_accept_dialogs=False)
+        cdp.ws.settimeout(5)
+        cdp.send("Page.enable", timeout=4)                       # 알림창이 뜨고 닫히는 것을 알기 위해
+        cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": ANCHOR_JS}, timeout=4)  # 새로고침 뒤에도 유지
+        st["cdp"] = cdp
+        st["id"] = page.get("id")
+
+    def run(self):
+        while not self._stop.is_set():
+            for t in self.targets:
+                if self._stop.is_set():
+                    break
+                try:
+                    self._tend(t)
+                except Exception:
+                    pass
+            self._wake.wait(timeout=self.PING_SEC)
+            self._wake.clear()
+        for st in self._st.values():
+            self._drop(st)
+
+    def _tend(self, t):
+        match = t["match"]
+        name = t.get("name", match)
+        st = self._st.setdefault(match, {"cdp": None, "id": None, "fail": 0, "vis": "",
+                                         "last_revive": 0.0, "dlg_warned": False})
+        try:
+            page = find_target_page(self.port, match)
+        except Exception:
+            self._drop(st)          # 크롬이 꺼짐
+            return
+        if not page or not page.get("webSocketDebuggerUrl"):
+            self._drop(st)
+            st["fail"] = 0
+            return
+        if st["cdp"] is None or st["id"] != page.get("id") or not st["cdp"].ws.connected:
+            self._drop(st)
+            try:
+                self._attach(st, page)
+            except Exception:
+                self._drop(st)
+                return
+        cdp = st["cdp"]
+        vis = None
+        try:
+            cdp.ws.settimeout(5)
+            vis = cdp.eval_value(ANCHOR_JS)
+        except Exception:
+            self._drop(st)          # 연결이 끊김(탭이 닫혔거나 바뀜) → 다음 번에 다시 붙는다
+            return
+        if vis in ("visible", "hidden", "prerender"):
+            st["fail"] = 0
+            st["vis"] = vis
+            st["dlg_warned"] = False
+            return
+        if not cdp.ws.connected:
+            self._drop(st)
+            return
+        # ── 대답이 없다 ──
+        st["fail"] += 1
+        if cdp.dialog:
+            # 알림창이 떠서 멈춘 것. 내용도 모르고 누르면 위험하니 건드리지 않는다.
+            if not st["dlg_warned"]:
+                st["dlg_warned"] = True
+                self._log("⚠ {} 탭에 알림창이 떠 있어 멈춰 있습니다: “{}” → 그 탭에서 확인해 주세요".format(
+                    name, cdp.dialog[:80]))
+                try:
+                    notify(name + " 확인 필요", "알림창이 떠 있습니다: " + cdp.dialog[:60])
+                except Exception:
+                    pass
+            return
+        looked_recently = (st["vis"] == "visible")     # 방금까지 보고 있던 탭이면 잠깐 바쁜 것일 수 있다
+        if st["fail"] < 2 or (looked_recently and st["fail"] < 6):
+            return
+        if time.time() - st["last_revive"] < 60:
+            return
+        st["last_revive"] = time.time()
+        self._revive(name, st)
+
+    def _revive(self, name, st):
+        cdp = st["cdp"]
+        self._log("⟳ {} 탭이 대답하지 않음(크롬이 탭을 재웠거나 메모리 부족으로 버림) → 새로고침으로 되살리는 중".format(name))
+        ok = False
+        try:
+            cdp.send("Page.reload", {"ignoreCache": False}, timeout=4)    # 브라우저가 처리 → 멈춘 탭에도 통한다
+            deadline = time.time() + 25
+            while time.time() < deadline and not self._stop.is_set():
+                time.sleep(2)
+                if not cdp.ws.connected:
+                    break
+                if cdp.alive(3):
+                    ok = True
+                    break
+        except Exception:
+            ok = False
+        if ok:
+            st["fail"] = 0
+            st["vis"] = "hidden"
+            time.sleep(3)             # 화면이 다 뜰 시간
+            self._log("✓ {} 탭을 되살렸습니다 — 세션 갱신을 바로 다시 합니다".format(name))
+            self.ui_post("stat", {"k": "revive"})
+            if self.on_revived:
+                try:
+                    self.on_revived()
+                except Exception:
+                    pass
+        else:
+            self._drop(st)
+            self._log("✗ {} 탭을 되살리지 못했습니다 — 크롬에서 그 탭을 한 번 눌러 주세요".format(name))
+            try:
+                notify(name + " 탭 멈춤", "자동으로 되살리지 못했습니다. 크롬에서 그 탭을 한 번 눌러 주세요.")
+            except Exception:
+                pass
+
+
 class KeepAliveWorker(threading.Thread):
     def __init__(self, port, targets, interval, ui_post):
         super().__init__(daemon=True)
@@ -1757,8 +2121,14 @@ class KeepAliveWorker(threading.Thread):
             self._wake.wait(timeout=self.interval)
             self._wake.clear()
 
+    auto_reenter = True       # 나이스가 '무효'라고 답하면 깨끗한 재접속을 자동으로 해 볼지
+    chrome_path = None
+
     def cycle(self):
         now = datetime.now().strftime("%H:%M:%S")
+        last = getattr(self, "_last_state", None)
+        if last is None:
+            last = self._last_state = {}
         for t in self.targets:
             if self._stop.is_set():
                 return
@@ -1766,14 +2136,60 @@ class KeepAliveWorker(threading.Thread):
                 state, detail = do_keepalive(self.port, t)
             except Exception as e:
                 state, detail = "실패", str(e)
+            # 나이스가 "이 접속은 무효"라고 답함 → 옛 쿠키 지우고 SSO로 다시 들어가 본다
+            if state == "경고" and NEIS_ZOMBIE_TAG in detail:
+                state, detail = self._heal_neis(t, state, detail)
             self.ui_post("status", {
                 "name": t["name"], "state": state, "last": now, "detail": detail
             })
             self.ui_post("log", "[{}] {} → {} {}".format(now, t["name"], state, detail))
             if state == "정상":
                 self.ui_post("stat", {"k": "keepalive"})
+            # '정상'이던 것이 두 번 연속 정상이 아니면 한 번만 알림 (자리를 비웠다 와도 알 수 있게)
+            prev = last.get(t["name"], {"state": None, "bad": 0, "told": False})
+            if state == "정상":
+                prev = {"state": state, "bad": 0, "told": False}
+            else:
+                prev = {"state": state, "bad": prev["bad"] + 1, "told": prev["told"]}
+                if prev["bad"] >= 2 and not prev["told"] and state != "탭없음":
+                    prev["told"] = True
+                    try:
+                        notify("세션 유지 문제 — " + t["name"], detail[:90])
+                    except Exception:
+                        pass
+            last[t["name"]] = prev
         nxt_sec = self.interval
         self.ui_post("next", nxt_sec)
+
+    def _heal_neis(self, t, state, detail):
+        """나이스 '빈 껍데기 접속' 자동 복구. 10분에 1번, 실행 중 최대 3번까지만(다른 PC와 서로 밀어내기 방지)."""
+        if not self.auto_reenter:
+            return state, detail + " → [나이스 열기]를 누르면 다시 접속합니다"
+        hist = getattr(self, "_heal_times", None)
+        if hist is None:
+            hist = self._heal_times = []
+        now = time.time()
+        if len(hist) >= 3 or (hist and now - hist[-1] < 600):
+            return state, detail + " → 자동 재접속은 이미 시도함. 다른 PC·기기에서 같은 계정으로 접속 중인지 확인하세요"
+        hist.append(now)
+        self.ui_post("log", "[{}] ⟳ {} — 옛 접속 흔적을 지우고 업무포털 SSO로 다시 접속합니다".format(
+            datetime.now().strftime("%H:%M:%S"), detail))
+        try:
+            ok, d = neis_reenter(self.port, self.chrome_path)
+        except Exception as e:
+            ok, d = False, str(e)
+        if not ok:
+            return "경고", "나이스 자동 재접속 실패: " + d
+        deadline = time.time() + 30
+        while time.time() < deadline and not self._stop.is_set():
+            time.sleep(3)
+            try:
+                st2, d2 = do_keepalive(self.port, t)
+            except Exception:
+                continue
+            if st2 == "정상":
+                return "정상", "나이스 자동 재접속 완료 · " + d2
+        return "경고", "나이스 재접속을 시도했지만 아직 확인되지 않음 — 다음 주기에 다시 확인"
 
     def trigger_now(self):
         self._wake.set()
@@ -1788,7 +2204,7 @@ class NeisGuardWorker(threading.Thread):
        (나이스 절대 60분 카운트다운은 팝업 클릭으로만 연장되므로 짧은 주기로 감시)"""
 
     def __init__(self, port, match, interval, ui_post, capture_path,
-                 reload_below_min=0, critical_min=0):
+                 reload_below_min=0, critical_min=0, extend_below_min=0):
         super().__init__(daemon=True)
         self.port = port
         self.match = match
@@ -1797,6 +2213,8 @@ class NeisGuardWorker(threading.Thread):
         self.capture_path = capture_path
         self.reload_below_min = float(reload_below_min or 0)
         self.critical_min = float(critical_min or 0)
+        self.extend_below_min = float(extend_below_min or 0)
+        self._dead_told = False       # '탭 무응답' 로그를 한 번만 찍기 위한 표시
         self._stop = threading.Event()
         self._last_remain = None      # 진단: 잔여시간 로그 스로틀용
         self._reload_cd_until = 0.0   # 리로드 직후 재리로드 방지(쿨다운)
@@ -1808,10 +2226,24 @@ class NeisGuardWorker(threading.Thread):
                 r = do_neis_guard(
                     self.port, self.match, self.capture_path,
                     reload_below_min=(0 if in_cd else self.reload_below_min),
-                    critical_min=(0 if in_cd else self.critical_min))
+                    critical_min=(0 if in_cd else self.critical_min),
+                    extend_below_min=self.extend_below_min)
                 now = datetime.now().strftime("%H:%M:%S")
                 remain = (r.get("remain") or "").strip()
-                if r.get("reloaded"):
+                if r.get("reason") == "무응답":
+                    _poke_anchor()                 # 탭 지킴이에게 '지금 되살려 달라'
+                    if not self._dead_told:
+                        self._dead_told = True
+                        self.ui_post("log", "[{}] · 나이스 탭이 대답하지 않아 남은 시간을 읽지 못함 → 되살리는 중".format(now))
+                    self._stop.wait(timeout=self.interval)
+                    continue
+                self._dead_told = False
+                if r.get("extended"):
+                    self._last_remain = None
+                    self.ui_post("log", "[{}] ⟳ 나이스 접속시간 연장 (잔여 {} → {}) — 화면 새로고침 없이".format(
+                        now, remain or "?", r.get("after") or "?"))
+                    self.ui_post("stat", {"k": "popup"})
+                elif r.get("reloaded"):
                     self._reload_cd_until = time.time() + 90   # 로드+여유 동안 재리로드 금지
                     self._last_remain = None
                     self.ui_post("log", "[{}] ⟳ 나이스 세션 임박(잔여 {}) → 페이지 새로고침으로 세션 리셋".format(
@@ -4756,9 +5188,33 @@ class ConsoleApp:
         except Exception as e:
             messagebox.showerror("오류", "로그인 자동화 실행 실패\n{}".format(e))
 
+    def _open_neis_smart(self):
+        """[나이스 열기]: 접속이 살아 있으면 그 탭을 앞으로, 죽었으면 '깨끗한 재접속'.
+           (나이스는 주소(main.jsp)를 그냥 열면 로그인이 안 되고, 업무포털 SSO 주소로 들어가야 한다.)"""
+        port = self._port()
+        try:
+            page = find_target_page(port, "neis.go.kr")
+            if page and neis_session_ok(port):
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:{}/json/activate/{}".format(port, page["id"]), timeout=4).read()
+                except Exception:
+                    pass
+                self.ui_post("log", "나이스: 이미 접속 중인 탭을 앞으로 가져왔습니다.")
+                return
+            ok, d = neis_reenter(port, find_chrome(self.cfg))
+            self.ui_post("log", "나이스 열기: " + d)
+            if ok and self.worker and self.worker.is_alive():
+                time.sleep(8)
+                self.worker.trigger_now()
+        except Exception as e:
+            self.ui_post("log", "나이스 열기 실패: {}".format(e))
+
     def open_site(self, name):
         url = self.cfg["urls"].get(name)
         if not url:
+            return
+        if name == "나이스" and HAS_WS:
+            threading.Thread(target=self._open_neis_smart, daemon=True).start()
             return
         chrome = find_chrome(self.cfg)
         # 디버그 크롬(같은 프로필)에 탭으로 열어야 세션 유지 대상이 됨
@@ -4776,6 +5232,7 @@ class ConsoleApp:
         if self.worker and self.worker.is_alive():
             self.worker.stop()
             self.worker = None
+            self._stop_anchor()
             if self.neis_guard:
                 self.neis_guard.stop()
                 self.neis_guard = None
@@ -4793,22 +5250,49 @@ class ConsoleApp:
         except Exception:
             pass
         self.worker = KeepAliveWorker(self._port(), self.cfg["keepalive_targets"], interval, self.ui_post)
+        self.worker.auto_reenter = bool(self.cfg.get("neis_auto_reenter", True))
+        self.worker.chrome_path = find_chrome(self.cfg)
         self.worker.start()
+        # 탭 지킴이: 대상 탭에 계속 붙어 있으면서, 크롬이 버리거나 얼린 탭을 되살린다
+        self._start_anchor()
         # 나이스 연장창 감시자(빠른 주기) 동시 시작
         neis_match = next((t["match"] for t in self.cfg["keepalive_targets"] if _infer_mode(t) == "neis"), None)
         if neis_match:
             gsec = self.cfg.get("neis_guard_sec", 20)
             rbelow = self.cfg.get("neis_reload_below_min", 12)
             rcrit = self.cfg.get("neis_reload_critical_min", 4)
+            rext = self.cfg.get("neis_extend_below_min", 30)
             self.neis_guard = NeisGuardWorker(self._port(), neis_match, gsec, self.ui_post,
                                               str(APP_DIR / "neis_popup_capture.html"),
-                                              reload_below_min=rbelow, critical_min=rcrit)
+                                              reload_below_min=rbelow, critical_min=rcrit,
+                                              extend_below_min=rext)
             self.neis_guard.start()
-            self.log("나이스 연장창 감시 시작 (매 {}초) — 임박 시 리로드로 세션 리셋(백그라운드 ≤{}분/전면 ≤{}분)".format(
-                gsec, rbelow, rcrit))
+            self.log("나이스 접속시간 감시 시작 (매 {}초) — 잔여 {}분 이하면 새로고침 없이 연장 (안 되면 새로고침: 백그라운드 ≤{}분/전면 ≤{}분)".format(
+                gsec, rext, rbelow, rcrit))
         self.keep_btn.config(text="세션 유지 중지")
         self.keep_state_var.set("세션 유지: 실행 중 (주기 {}분)".format(max(1, interval // 60)))
         self.log("세션 유지를 시작했습니다. (주기 {}초)".format(interval))
+
+    def _start_anchor(self):
+        global TAB_ANCHOR
+        self._stop_anchor()
+
+        def revived():
+            if self.worker and self.worker.is_alive():
+                self.worker.trigger_now()
+
+        self.tab_anchor = TabAnchorWorker(self._port(), self.cfg["keepalive_targets"], self.ui_post, revived)
+        TAB_ANCHOR = self.tab_anchor
+        self.tab_anchor.start()
+        self.log("탭 지킴이 시작 — 나이스·에듀파인 탭이 멈추면(크롬이 탭을 버리거나 재우면) 자동으로 되살립니다")
+
+    def _stop_anchor(self):
+        global TAB_ANCHOR
+        a = getattr(self, "tab_anchor", None)
+        if a is not None:
+            a.stop()
+        self.tab_anchor = None
+        TAB_ANCHOR = None
 
     def refresh_now(self):
         if self.worker and self.worker.is_alive():
