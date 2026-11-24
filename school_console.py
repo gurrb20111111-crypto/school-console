@@ -503,162 +503,6 @@ ATTENDANCE_JS_TMPL = FRAME_WALK + r"""
 """
 
 
-# ── 수행평가 누락 확인: 나이스 '수행평가성적관리' 표를 읽어 점수 빈 학생 찾기 ──
-#  안정적인 한글 머리글 '점수'(각 수행평가의 점수 열)·'성명'(학생 열)을 기준점으로
-#  좌표를 잡아 표를 격자로 복원한다(클래스명 추측 X, 좌표 기반이라 덜 깨짐).
-#  주의: 나이스가 스크롤 시 행을 동적 생성하면 '화면에 그려진 행'만 읽힐 수 있음.
-PERF_MISSING_JS = FRAME_WALK + r"""
-(function(){
-  var docs=__collectDocs();
-  function vis(el){ try{ var r=el.getBoundingClientRect(); return r.width>3 && r.height>3; }catch(e){ return false; } }
-  function rc(el){ var r=el.getBoundingClientRect(); return {x:r.left+r.width/2, y:r.top+r.height/2}; }
-  function leaf(el){ return !(el.children && el.children.length>0); }
-
-  // 1) '점수' 서브헤더 = 각 수행평가의 점수 열 x좌표
-  var scoreCols=[], subY=null;
-  for (var d=0; d<docs.length; d++){
-    var cs=docs[d].querySelectorAll('td,th,div,span');
-    for (var i=0;i<cs.length;i++){
-      var c=cs[i]; if(!leaf(c)) continue;
-      var t=(c.innerText||c.textContent||'').replace(/\s+/g,' ').trim();
-      if (t!=='점수' || !vis(c)) continue;
-      var p=rc(c); scoreCols.push(p.x); if(subY===null || p.y<subY) subY=p.y;
-    }
-  }
-  if(!scoreCols.length) return JSON.stringify({error:'no-score-header'});
-  scoreCols.sort(function(a,b){return a-b;});
-  // 가까운 중복 제거
-  var sc=[]; for(var s=0;s<scoreCols.length;s++){ if(!sc.length||Math.abs(scoreCols[s]-sc[sc.length-1])>20) sc.push(scoreCols[s]); }
-  scoreCols=sc;
-
-  // 2) 수행평가 제목(점수 헤더보다 위쪽의 텍스트)
-  var titles=[];
-  var EXCL=/^(점수|결시명칭|학적변동|만점|합계|평균|성명|반|번호|학년도|학기|학년|과목|영역|강의실|순위|수강생|응시생|결시생|학적변동수)/;
-  for (var d2=0; d2<docs.length; d2++){
-    var hs=docs[d2].querySelectorAll('td,th,div,span');
-    for (var j=0;j<hs.length;j++){
-      var h=hs[j]; if(!leaf(h)) continue;
-      var ht=(h.innerText||h.textContent||'').replace(/\s+/g,' ').trim();
-      if (ht.length<3 || ht.length>45) continue;
-      if (EXCL.test(ht) || /^만점\(\d+\)$/.test(ht)) continue;
-      if (!vis(h)) continue;
-      var hp=rc(h); if(hp.y>=subY-3) continue;
-      titles.push({text:ht, x:hp.x});
-    }
-  }
-  function titleFor(x){ var b='',bd=1e9; for(var k=0;k<titles.length;k++){var dd=Math.abs(titles[k].x-x); if(dd<bd){bd=dd;b=titles[k].text;}} return bd<150?b:''; }
-
-  // 3) '성명' 열 x
-  var nameColX=null;
-  for (var d3=0; d3<docs.length; d3++){
-    var ns=docs[d3].querySelectorAll('td,th,div,span');
-    for (var m=0;m<ns.length;m++){
-      var e3=ns[m]; if(!leaf(e3)) continue;
-      var tt=(e3.innerText||e3.textContent||'').replace(/\s+/g,' ').trim();
-      if (tt==='성명' && vis(e3)){ nameColX=rc(e3).x; break; }
-    }
-    if(nameColX!==null) break;
-  }
-
-  // 4) 학생 이름 행 (성명 열 근처의 한글 이름)
-  var NAME_RE=/^[가-힣]{2,4}$/, rows=[];
-  for (var d4=0; d4<docs.length; d4++){
-    var es=docs[d4].querySelectorAll('td,div,span,a');
-    for (var n=0;n<es.length;n++){
-      var e=es[n]; if(!leaf(e)) continue;
-      var nt=(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim();
-      if (!NAME_RE.test(nt) || !vis(e)) continue;
-      var ep=rc(e);
-      if (ep.y<=subY) continue;
-      if (nameColX!==null && Math.abs(ep.x-nameColX)>80) continue;
-      rows.push({name:nt, y:ep.y});
-    }
-  }
-  rows.sort(function(a,b){return a.y-b.y;});
-  var ur=[]; for(var r=0;r<rows.length;r++){ if(!ur.length||Math.abs(rows[r].y-ur[ur.length-1].y)>6) ur.push(rows[r]); }
-  rows=ur;
-  if(!rows.length) return JSON.stringify({error:'no-rows', columns:scoreCols.length});
-
-  var gap=18;
-  if(rows.length>1){ var gs=[]; for(var g=1;g<rows.length;g++) gs.push(rows[g].y-rows[g-1].y); gs.sort(function(a,b){return a-b;}); gap=gs[Math.floor(gs.length/2)]||18; }
-  var tol=Math.max(8, gap*0.6);
-  function rowFor(y){ var bi=-1,bd=1e9; for(var i=0;i<rows.length;i++){var dd=Math.abs(rows[i].y-y); if(dd<bd){bd=dd;bi=i;}} return bd<=tol?bi:-1; }
-  function colFor(x){ var bi=-1,bd=1e9; for(var i=0;i<scoreCols.length;i++){var dd=Math.abs(scoreCols[i]-x); if(dd<bd){bd=dd;bi=i;}} return bd<=28?bi:-1; }
-
-  // 5) 점수 input 읽기 → 격자 배치
-  var grid={};
-  for (var d5=0; d5<docs.length; d5++){
-    var ins=docs[d5].querySelectorAll('input');
-    for (var ii=0;ii<ins.length;ii++){
-      var el2=ins[ii]; var ty=(el2.type||'text').toLowerCase();
-      if (ty==='checkbox'||ty==='radio'||ty==='button'||ty==='hidden'||ty==='submit'||ty==='image') continue;
-      if (!vis(el2)) continue;
-      var ip=rc(el2);
-      var ci=colFor(ip.x); if(ci<0) continue;
-      var ri=rowFor(ip.y); if(ri<0) continue;
-      grid[ci]=grid[ci]||{};
-      grid[ci][ri]=(el2.value||'').trim();
-    }
-  }
-
-  // 6) 수행평가별 누락 집계
-  var items=[];
-  for (var ci2=0; ci2<scoreCols.length; ci2++){
-    var nm=titleFor(scoreCols[ci2]) || ('수행평가'+(ci2+1));
-    var colmap=grid[ci2]||{}; var miss=[], filled=0, read=0;
-    for (var ri2=0; ri2<rows.length; ri2++){
-      if(!(ri2 in colmap)) continue;
-      read++;
-      if(colmap[ri2]==='') miss.push(rows[ri2].name); else filled++;
-    }
-    items.push({assessment:nm, total:rows.length, read:read, filled:filled, missing:miss});
-  }
-  return JSON.stringify({students:rows.length, columns:scoreCols.length, items:items});
-})();
-"""
-
-
-# ── 수행평가 누락 확인 (확정판): 화면 하단 '합계 행'을 읽어 수행평가별 누락 인원 산출 ──
-#  나이스 그리드는 가상스크롤(보이는 행만 DOM) + cl-grid 프레임워크라 셀 직접 읽기는 불완전.
-#  대신 '수강생/응시생/결시생/학적변동수' 합계(예: 22/21/0/1)를 읽어 22명 전체 기준으로 계산.
-#  누락 = 수강 - 응시(입력) - 결시 - 학적변동.  (라이브 검증: 목제품 22/0/0/0 → 누락 22 ✓)
-PERF_SUMMARY_JS = r"""
-(function(){
-  function vis(el){try{var r=el.getBoundingClientRect();return r.width>2&&r.height>2;}catch(e){return false;}}
-  function leaf(el){return !(el.children&&el.children.length>0);}
-  function cx(el){var r=el.getBoundingClientRect();return Math.round(r.left+r.width/2);}
-  function cy(el){var r=el.getBoundingClientRect();return Math.round(r.top+r.height/2);}
-  var all=document.querySelectorAll("div,span,td,th");
-  // '점수' 헤더 y로 수행평가 영역 존재 확인 + 이름 행 위치
-  var scoreY=null;
-  for(var j=0;j<all.length;j++){var e2=all[j];if(!leaf(e2))continue;var t2=(e2.innerText||e2.textContent||"").replace(/\s+/g," ").trim();if(t2==="점수"&&vis(e2)){if(scoreY===null||cy(e2)<scoreY)scoreY=cy(e2);}}
-  if(scoreY===null) return JSON.stringify({error:"no-score-header"});
-  // 수행평가 이름(점수 헤더 바로 위 띠)
-  var EXCL=/^(점수|결시명칭|학적변동|만점|합계|평균|성명|반|번호|학년도|학기|학년|과목|영역|강의실|순위|수강생|응시생|결시생)/;
-  var names=[];
-  for(var k=0;k<all.length;k++){var e3=all[k];if(!leaf(e3))continue;var t3=(e3.innerText||e3.textContent||"").replace(/\s+/g," ").trim();if(t3.length<3||t3.length>45)continue;if(EXCL.test(t3)||/^만점\(\d+\)$/.test(t3))continue;if(!vis(e3))continue;var y3=cy(e3);if(y3<scoreY-20&&y3>scoreY-90){names.push({name:t3,x:cx(e3)});}}
-  // 합계 행 셀: 수강/응시/결시/학적변동 (예: 22/21/0/1)
-  var SUM=/^(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)$/;
-  var sums=[];
-  for(var i=0;i<all.length;i++){var e=all[i];if(!leaf(e))continue;var t=(e.innerText||e.textContent||"").replace(/\s+/g,"").trim();var m=t.match(SUM);if(m&&vis(e)){sums.push({x:cx(e), su:parseInt(m[1],10), eu:parseInt(m[2],10), gy:parseInt(m[3],10), ha:parseInt(m[4],10)});}}
-  if(!names.length||!sums.length) return JSON.stringify({error:"no-summary", names:names.length, sums:sums.length});
-  function nearest(x,arr){var bi=-1,bd=1e9;for(var z=0;z<arr.length;z++){var dd=Math.abs(arr[z].x-x);if(dd<bd){bd=dd;bi=z;}}return bd<60?bi:-1;}
-  var items=[];
-  for(var n=0;n<names.length;n++){
-    var si=nearest(names[n].x, sums); if(si<0) continue;
-    var s=sums[si]; var miss=s.su-s.eu-s.gy-s.ha; if(miss<0)miss=0;
-    items.push({assessment:names[n].name, total:s.su, filled:s.eu, gyeolsi:s.gy, hakjeok:s.ha, missing:miss});
-  }
-  // 현재 '반' 추정: '반' 헤더 컬럼 바로 아래 첫 숫자
-  var banX=null, banY=null;
-  for(var p=0;p<all.length;p++){var e5=all[p];if(!leaf(e5))continue;var t5=(e5.innerText||e5.textContent||"").replace(/\s+/g,"").trim();if(t5==="반"&&vis(e5)){banX=cx(e5);banY=cy(e5);break;}}
-  var ban="";
-  if(banX!==null){var bd=1e9;for(var q=0;q<all.length;q++){var e6=all[q];if(!leaf(e6))continue;var t6=(e6.innerText||e6.textContent||"").replace(/\s+/g,"").trim();if(/^[1-9]$/.test(t6)&&vis(e6)){var yy=cy(e6);var dd=Math.abs(cx(e6)-banX);if(yy>banY+5&&dd<45&&dd<bd){bd=dd;ban=t6;}}}}
-  return JSON.stringify({items:items, ban:ban});
-})();
-"""
-
-
 def list_pages(port):
     url = "http://127.0.0.1:{}/json/list".format(port)
     with urllib.request.urlopen(url, timeout=4) as r:
@@ -1326,9 +1170,16 @@ NEIS_HELPER_JS = r"""
     return t.split('\n')[0].trim();
   }
   function head(el){ return (txt(el).split(/\s+/)[0] || ''); }
+  // 창이 좁으면(크롬 창 958px 등) [조회]·[저장] 버튼이 화면 오른쪽 밖에 있다.
+  // 밖에 있는 좌표를 누르면 아무 일도 안 일어나므로, 먼저 화면 안으로 끌어온 뒤 좌표를 잰다. (2026-11-24 실측)
   function xy(el){
     var r = el.getBoundingClientRect();
-    return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)};
+    if(r.left < 0 || r.top < 0 || r.right > innerWidth || r.bottom > innerHeight){
+      try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+      r = el.getBoundingClientRect();
+    }
+    return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2),
+            off: (r.right > innerWidth || r.bottom > innerHeight || r.left < 0 || r.top < 0)};
   }
   function rows(){
     return Array.prototype.slice.call(document.querySelectorAll('.cl-grid-row'));
@@ -1340,38 +1191,54 @@ NEIS_HELPER_JS = r"""
     for(var i=0;i<rs.length;i++){
       var k = rs[i].children;
       if(!k.length || head(k[0]) !== '번호') continue;
+      if(!vis(rs[i])) continue;            // 나이스 안의 다른 화면 탭 뒤에 숨은 출결 그리드는 누를 수 없다
       var cols = [];
       for(var j=0;j<k.length;j++) cols.push(head(k[j]));
-      if(cols.indexOf('성명') !== -1) return {el: rs[i], cols: cols};
+      if(cols.indexOf('성명') !== -1){
+        var g = rs[i].closest ? rs[i].closest('.cl-grid') : null;
+        return {el: rs[i], cols: cols, grid: g};
+      }
     }
     return null;
   }
 
-  // 데이터행. 행마다 앞쪽에 '숨은 열'이 붙는 경우가 있어 보정값(off)을 행별로 구한다.
-  // 고정값(+1)으로 박아두면 나이스가 열 구성을 바꾼 날 조용히 옆 칸을 누른다.
-  function data(cols){
-    var iNo = cols.indexOf('번호'), iNm = cols.indexOf('성명');
+  // 데이터행의 칸을 '헤더 칸과 가로로 가장 많이 겹치는 칸'으로 찾는다.
+  // 나이스 일일출결 그리드는 데이터행에만 성명 옆 좁은 칸(35px)이 하나 더 있어서
+  // 칸 번호로 짝지으면 '마감'을 누를 때 그 좁은 칸을, '조회'를 읽을 때 마감 칸을 집었다. (2026-11-24 실측)
+  function cellFor(rowEl, h, ci){
+    var hc = h.el.children[ci];
+    if(!hc) return null;
+    var hr = hc.getBoundingClientRect();
+    if(hr.width < 2) return null;
+    var k = rowEl.children, best = null, bestOv = 0;
+    for(var i=0;i<k.length;i++){
+      var r = k[i].getBoundingClientRect();
+      var ov = Math.min(r.right, hr.right) - Math.max(r.left, hr.left);
+      if(ov > bestOv + 0.5){ bestOv = ov; best = k[i]; }
+    }
+    return bestOv >= Math.min(10, hr.width / 2) ? best : null;
+  }
+
+  function data(h){
+    var cols = h.cols, iNo = cols.indexOf('번호'), iNm = cols.indexOf('성명');
     var out = [], rs = rows();
     for(var i=0;i<rs.length;i++){
-      var k = rs[i].children;
-      if(k.length < cols.length) continue;              // 공지 그리드(3칸) 등은 제외
-      var cand = [k.length - cols.length, 0, 1], picked = null;
-      for(var c=0;c<cand.length;c++){
-        var off = cand[c];
-        if(off < 0 || off + cols.length > k.length) continue;
-        var no = head(k[off + iNo]), nm = txt(k[off + iNm]);
-        if(!/^\d{1,3}$/.test(no)) continue;             // 헤더행·합계행 걸러짐
-        if(!nm || /^\d+$/.test(nm)) continue;
-        picked = {el: rs[i], off: off, no: no, name: nm};
-        break;
-      }
-      if(picked) out.push(picked);
+      var row = rs[i];
+      if(row === h.el) continue;
+      if(h.grid && !h.grid.contains(row)) continue;     // 다른 그리드(공지 등) 제외
+      var cNo = cellFor(row, h, iNo), cNm = cellFor(row, h, iNm);
+      if(!cNo || !cNm) continue;
+      var no = head(cNo), nm = txt(cNm);
+      if(!/^\d{1,3}$/.test(no)) continue;               // 헤더행·합계행 걸러짐
+      if(!nm || /^\d+$/.test(nm)) continue;
+      out.push({el: row, off: row.children.length - cols.length, no: no, name: nm,
+                cell: (function(rw){ return function(ci){ return cellFor(rw, h, ci); }; })(row)});
     }
     return out;
   }
 
-  function pick(cols, no, name){
-    var d = data(cols);
+  function pick(h, no, name){
+    var d = data(h);
     var hit = d.filter(function(r){ return r.no === String(no) && r.name === name; });
     if(!hit.length) hit = d.filter(function(r){ return r.name === name; });
     if(!hit.length) return {err: no + '번 ' + name + ' 행을 못 찾음'};
@@ -1427,11 +1294,12 @@ NEIS_HELPER_JS = r"""
   }
 
   window.__sc = {
+    hasGrid: function(){ return header() ? '1' : '0'; },
     // ── 읽기 ────────────────────────────────────────────────
     read: function(){
       var h = header();
       if(!h) return JSON.stringify({err: "그리드에서 '번호·성명' 헤더를 못 찾았습니다 — 일일출결관리(담임용) 화면인지 확인하세요"});
-      var cols = h.cols, d = data(cols);
+      var cols = h.cols, d = data(h);
       var iM = cols.indexOf('마감'), iR = cols.indexOf('사유');
       var marky = [];
       for(var c=0;c<cols.length;c++){
@@ -1441,12 +1309,13 @@ NEIS_HELPER_JS = r"""
       for(var i=0;i<d.length;i++){
         var r = d[i], marks = [];
         for(var m=0;m<marky.length;m++){
-          var t = txt(r.el.children[r.off + marky[m]]);
-          if(t) marks.push(cols[marky[m]] + ':' + t);
+          var t = txt(r.cell(marky[m]));
+          // '미마감' = 그 교시 담당 교사가 아직 마감 안 함(분홍색) — 학생 출결이 아니므로 뺀다
+          if(t && t !== '미마감') marks.push(cols[marky[m]] + ':' + t);
         }
         out.push({no: r.no, name: r.name, off: r.off,
-                  magam: iM >= 0 ? txt(r.el.children[r.off + iM]) : '',
-                  reason: iR >= 0 ? txt(r.el.children[r.off + iR]) : '',
+                  magam: iM >= 0 ? txt(r.cell(iM)) : '',
+                  reason: iR >= 0 ? txt(r.cell(iR)) : '',
                   marks: marks.join(' ')});
       }
       return JSON.stringify({cols: cols, rows: out});
@@ -1476,12 +1345,14 @@ NEIS_HELPER_JS = r"""
       if(!h) return JSON.stringify({err: '그리드 헤더를 못 찾았습니다'});
       var ci = h.cols.indexOf(colName);
       if(ci < 0) return JSON.stringify({err: "이 날 화면에 '" + colName + "' 칸이 없습니다"});
-      var p = pick(h.cols, no, name);
+      var p = pick(h, no, name);
       if(p.err) return JSON.stringify({err: p.err});
-      var cell = p.row.el.children[p.row.off + ci];
+      var cell = p.row.cell(ci);
       if(!cell) return JSON.stringify({err: '셀 위치 계산 실패'});
       try { cell.scrollIntoView({block: 'center'}); } catch(e) {}
-      var t = cell.querySelector('.cl-text') || cell;
+      // 빈 칸(아직 아무것도 안 넣은 마감 칸)은 .cl-text 크기가 0이라 셀 자체를 누른다 (2026-11-24 실측)
+      var t = cell.querySelector('.cl-text');
+      if(!t || !vis(t)) t = cell;
       if(!vis(t)) return JSON.stringify({err: "'" + colName + "' 칸이 화면에 안 보입니다(가로 스크롤 확인)"});
       var c = xy(t); c.col = colName;
       return JSON.stringify(c);
@@ -1537,28 +1408,43 @@ NEIS_HELPER_JS = r"""
 """
 
 
+def find_target_pages(port, match):
+    return [p for p in list_pages(port) if p.get("type") == "page" and match in (p.get("url") or "")]
+
+
 def _att_open(port, match):
-    """나이스 탭에 붙고 헬퍼(__sc)를 심는다. (cdp, status)."""
-    page = find_target_page(port, match)
-    if not page:
+    """나이스 탭에 붙고 헬퍼(__sc)를 심는다. (cdp, status).
+       나이스 탭이 여러 개면(창을 두 번 연 경우 등) '번호·성명' 출결 그리드가 보이는 탭을 고른다.
+       예전엔 첫 탭에만 붙어서, 출결 화면이 다른 탭에 있으면 엉뚱한 탭을 읽었다. (2026-11-24)"""
+    pages = [p for p in find_target_pages(port, match) if p.get("webSocketDebuggerUrl")]
+    if not pages:
         return None, "탭없음 — 나이스를 먼저 여세요"
-    ws_url = page.get("webSocketDebuggerUrl")
-    if not ws_url:
-        return None, "webSocket 주소 없음"
-    cdp = CDP(ws_url)
-    try:
-        cdp.send("Page.enable")
-        cdp.send("Page.setWebLifecycleState", {"state": "active"})
-        if cdp.eval_value(NEIS_HELPER_JS) != "__sc_v1":
-            cdp.close()
-            return None, "화면 읽기 스크립트를 심지 못했습니다"
-        return cdp, "ok"
-    except Exception as e:
+    fallback, last_err = None, "화면 읽기 스크립트를 심지 못했습니다"
+    for page in pages:
+        cdp = CDP(page["webSocketDebuggerUrl"])
         try:
-            cdp.close()
-        except Exception:
-            pass
-        return None, str(e)
+            cdp.send("Page.enable")
+            cdp.send("Page.setWebLifecycleState", {"state": "active"})
+            if cdp.eval_value(NEIS_HELPER_JS) != "__sc_v1":
+                cdp.close()
+                continue
+            if cdp.eval_value("__sc.hasGrid()") == "1":
+                if fallback:
+                    fallback.close()
+                return cdp, "ok"
+            if fallback is None:
+                fallback = cdp
+            else:
+                cdp.close()
+        except Exception as e:
+            last_err = str(e)
+            try:
+                cdp.close()
+            except Exception:
+                pass
+    if fallback:
+        return fallback, "ok"
+    return None, last_err
 
 
 def _sc(cdp, call):
@@ -1642,6 +1528,9 @@ def do_load_roster_by_date(port, date8, match="sen.neis.go.kr"):
         got = _sc(cdp, "read()")
         if got.get("err"):
             return None, got["err"]
+        if not got.get("rows"):
+            return None, ("조회했는데 학생이 0명입니다 — 나이스 화면에서 학년·반·일자가 맞는지, "
+                          "[조회]가 눌렸는지 확인하세요")
         return got, "ok"
     except Exception as e:
         return None, str(e)
@@ -1883,23 +1772,117 @@ def do_attendance_check(port, att):
         cdp.close()
 
 
+# ── 수행평가 누락 확인 (2026-11-24 다시 만듦) ──
+#  나이스 '교과담임 → 성적 → 수행평가 → 수행평가성적관리'를 [조회]한 화면을 읽는다(읽기만).
+#  그리드는 '화면에 보이는 칸·줄만' 그리므로, 읽는 동안 탭의 화면 크기를 잠깐 크게(가로 4200) 바꿔
+#  수행평가 전부·학생 전부가 그려지게 한 뒤 읽고 원래대로 돌린다. 예전엔 창 크기 그대로 읽어서
+#  958px 창에서는 앞쪽 수행평가 2개만 보였다(점수 들어간 뒤쪽 2개를 통째로 놓침).
+#  칸 짝짓기는 '머리글 칸과 가로로 가장 많이 겹치는 칸' — 칸 번호에 기대지 않는다.
+PERF_PROBE_JS = r"""
+(function(){
+  var rs=document.querySelectorAll('.cl-grid-row');
+  for(var i=0;i<rs.length;i++){ var k=rs[i].children;
+    if(k.length && (k[0].innerText||'').trim()==='점수' && (rs[i].innerText||'').indexOf('결시명칭')>=0) return '1'; }
+  return '0';
+})()
+"""
+
+PERF_READ_JS = r"""
+(function(){
+  function t1(el){ return el ? ((el.innerText||el.textContent||'').trim().split('\n')[0].trim()) : ''; }
+  function R(el){ return el.getBoundingClientRect(); }
+  function ov(a, b){ return Math.min(a.right, b.right) - Math.max(a.left, b.left); }
+  function cellIn(row, rect){
+    var k=row.children, best=null, bo=0;
+    for(var i=0;i<k.length;i++){ var o=ov(R(k[i]), rect); if(o>bo+0.5){ bo=o; best=k[i]; } }
+    return bo >= Math.min(10, rect.width/2) ? best : null;
+  }
+  var rows=[].slice.call(document.querySelectorAll('.cl-grid-row'));
+  var top=null, sub=null;
+  for(var i=0;i<rows.length;i++){
+    var k=rows[i].children, texts=[].map.call(k, t1);
+    if(!sub && texts[0]==='점수' && texts.indexOf('결시명칭')>=0) sub=rows[i];
+    if(!top && texts.indexOf('성명')>=0 && texts.indexOf('번호')>=0) top=rows[i];
+  }
+  if(!sub || !top) return JSON.stringify({error:'no-score-header'});
+  var grid = top.closest ? top.closest('.cl-grid') : null;
+  var tk=top.children, hNo=null, hBan=null, hName=null, asm=[];
+  for(var j=0;j<tk.length;j++){
+    var tx=t1(tk[j]);
+    if(tx==='번호') hNo=R(tk[j]); else if(tx==='반') hBan=R(tk[j]); else if(tx==='성명') hName=R(tk[j]);
+    else if(hName && tx && !/^합계/.test(tx) && R(tk[j]).width>20) asm.push({name:tx, rect:R(tk[j]), cols:{}});
+  }
+  var sk=sub.children;
+  for(var s=0;s<sk.length;s++){
+    var kind=t1(sk[s]), r=R(sk[s]);
+    if(kind!=='점수' && kind!=='결시명칭' && kind!=='학적변동') continue;
+    for(var a=0;a<asm.length;a++) if(ov(r, asm[a].rect) > r.width/2) asm[a].cols[kind]=r;
+  }
+  // 학생 줄
+  var kids=[];
+  for(var q=0;q<rows.length;q++){
+    var rw=rows[q]; if(rw===top || rw===sub) continue;
+    if(grid && !grid.contains(rw)) continue;
+    var cNo=cellIn(rw, hNo), cNm=cellIn(rw, hName);
+    if(!cNo || !cNm) continue;
+    var no=t1(cNo), nm=t1(cNm).replace(/\s*\[.*$/, '').trim();
+    if(!/^\d{1,3}$/.test(no) || !nm || /^\d+$/.test(nm)) continue;
+    kids.push({row:rw, no:no, name:nm, ban: hBan ? t1(cellIn(rw, hBan)) : ''});
+  }
+  // 아래 합계 줄 '수강/응시/결시/학적변동' (예: 21/19/0/1)
+  var SUM=/^(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)\s*\/\s*(\d+)$/, sums=[];
+  document.querySelectorAll('div,span,td').forEach(function(e){
+    if(e.children && e.children.length) return;
+    var m=(e.innerText||e.textContent||'').replace(/\s+/g,'').match(SUM);
+    if(m) sums.push({rect:R(e), su:+m[1], eu:+m[2], gy:+m[3], ha:+m[4]});
+  });
+  var items=[];
+  for(var b=0;b<asm.length;b++){
+    var A=asm[b], who=[], gy=0, ha=0, filled=0;
+    for(var z=0;z<kids.length;z++){
+      var K=kids[z];
+      var sc=A.cols['점수'] ? t1(cellIn(K.row, A.cols['점수'])) : '';
+      var g=A.cols['결시명칭'] ? t1(cellIn(K.row, A.cols['결시명칭'])) : '';
+      var h=A.cols['학적변동'] ? t1(cellIn(K.row, A.cols['학적변동'])) : '';
+      if(sc) filled++; else if(g) gy++; else if(h) ha++;
+      else who.push((K.ban ? K.ban + '반 ' : '') + K.no + '번 ' + K.name);
+    }
+    var sm=null;
+    for(var y=0;y<sums.length;y++) if(ov(sums[y].rect, A.rect) > A.rect.width/2){ sm=sums[y]; break; }
+    items.push({assessment:A.name, total: sm ? sm.su : kids.length, filled: sm ? sm.eu : filled,
+                gyeolsi: sm ? sm.gy : gy, hakjeok: sm ? sm.ha : ha,
+                missing: who.length, who: who, read: kids.length});
+  }
+  var bans={}; kids.forEach(function(K){ if(K.ban) bans[K.ban]=1; });
+  return JSON.stringify({items:items, ban:Object.keys(bans).join(','), students:kids.length});
+})()
+"""
+
+
 def do_check_perf(port, match):
-    """나이스 수행평가성적관리 표를 읽어 점수 빈 학생을 수행평가별로 집계. (data, status)."""
-    page = find_target_page(port, match)
-    if not page:
+    """나이스 수행평가성적관리 표를 읽어 수행평가별 누락 학생을 찾는다(읽기만). (data, status)."""
+    pages = [p for p in find_target_pages(port, match) if p.get("webSocketDebuggerUrl")]
+    if not pages:
         return None, "탭없음"
-    ws_url = page.get("webSocketDebuggerUrl")
-    if not ws_url:
-        return None, "webSocket 주소 없음"
-    cdp = CDP(ws_url)
-    try:
-        cdp.send("Page.enable")
-        cdp.send("Page.setWebLifecycleState", {"state": "active"})
-        return json.loads(cdp.eval_value(PERF_SUMMARY_JS) or "{}"), "ok"
-    except Exception as e:
-        return None, str(e)
-    finally:
-        cdp.close()
+    for page in pages:
+        cdp = CDP(page["webSocketDebuggerUrl"])
+        try:
+            cdp.send("Page.setWebLifecycleState", {"state": "active"})
+            if cdp.eval_value(PERF_PROBE_JS) != "1":
+                continue
+            try:
+                cdp.send("Emulation.setDeviceMetricsOverride",
+                         {"width": 4200, "height": 2600, "deviceScaleFactor": 1, "mobile": False})
+                time.sleep(2.5)                       # 그리드가 늘어난 크기로 다시 그릴 시간
+                data = json.loads(cdp.eval_value(PERF_READ_JS) or "{}")
+            finally:
+                cdp.send("Emulation.clearDeviceMetricsOverride", {})
+            return data, "ok"
+        except Exception as e:
+            return None, str(e)
+        finally:
+            cdp.close()
+    return {"error": "no-score-header"}, "ok"
 
 
 # 관제 상태 영속화 (재시작해도 '직전 건수/이미 본 서류' 유지 → 첫 확인 때 헛알림 방지)
@@ -3329,6 +3312,7 @@ class ConsoleApp:
         self._build_query()
         self._build_template()       # → self.tab_tpl (나이스 업무 하위)
         self._build_attendance()     # → self.tab_att (나이스 업무 하위)
+        self._build_perf()           # → self.tab_perf (나이스 업무 하위)
         self._build_dday()
         self._build_meal()
         self._build_alim()
@@ -3375,7 +3359,7 @@ class ConsoleApp:
         self._build_dashboard(frm)               # 예전 '세션·관제' 탭을 오늘 탭 아래쪽으로 합침
         ttk.Label(frm, foreground="#888", justify="left", text=(
             "· 결재/공람·E알리미는 해당 사이트 탭이 디버그 크롬에 열려 로그인돼 있어야 읽힙니다.\n"
-            "· 출결 입력은 '나이스 업무 → 출결 마감', 미마감·수행평가 누락 점검은 '조회 대시보드' 탭에서 하세요.")
+            "· 출결 입력은 '나이스 업무 → 출결 마감', 수행평가 누락은 '나이스 업무 → 수행평가 누락 확인', 출결 미마감 점검은 '조회 대시보드' 탭에서 하세요.")
         ).pack(anchor="w", pady=(2, 0))
 
     def toggle_tts(self):
@@ -4760,9 +4744,11 @@ class ConsoleApp:
         subcon.pack(fill="both", expand=True, padx=12, pady=(2, 10))
         self.tab_tpl = ttk.Frame(subcon, padding=(0, 8, 0, 0))
         self.tab_att = ttk.Frame(subcon, padding=(0, 8, 0, 0))
+        self.tab_perf = ttk.Frame(subcon, padding=(0, 8, 0, 0))
         subdefs = [
-            ("복무·기안 템플릿", self.tab_tpl, "#7b5ea7", "#ece4f4"),
-            ("출결 마감",        self.tab_att, "#c0504d", "#f4e2e1"),
+            ("복무·기안 템플릿",   self.tab_tpl,  "#7b5ea7", "#ece4f4"),
+            ("출결 마감",          self.tab_att,  "#c0504d", "#f4e2e1"),
+            ("수행평가 누락 확인", self.tab_perf, "#2a7f62", "#d7eee5"),
         ]
         self._sub_btns = {}
         self._sub_meta = {}
@@ -4873,16 +4859,16 @@ class ConsoleApp:
         self.att_result = tk.StringVar(value="아직 점검 안 함")
         ttk.Label(lf2, textvariable=self.att_result, justify="left", wraplength=940).pack(anchor="w", pady=(8, 0))
 
-        # --- 수행평가 누락 확인 (반별 누적) ---
-        lf3 = ttk.LabelFrame(frm, text="수행평가 누락 확인   🚧 개발 중 (미완성)", padding=8)
-        lf3.pack(fill="both", expand=True, pady=(10, 0))
-        ttk.Label(lf3, foreground="#c0392b", font=("Malgun Gothic", 10, "bold"), text=(
-            "🚧 현재 개발 중인 기능입니다 (미완성) — 강의실은 나이스에서 직접 바꿔가며 사용하세요.")
-        ).pack(anchor="w", pady=(0, 4))
+    def _build_perf(self):
+        """'나이스 업무 → 수행평가 누락 확인' (예전엔 조회 대시보드 아래에 있었음)."""
+        frm = self.tab_perf
+        lf3 = ttk.LabelFrame(frm, text="수행평가 누락 확인", padding=8)
+        lf3.pack(fill="both", expand=True)
         ttk.Label(lf3, foreground="#555", justify="left", wraplength=940, text=(
-            "① 나이스에서 강의실(반)을 바꾸고 반드시 [조회]  →  ② 콘솔에서 반 번호 넣고 [현재 반 추가].\n"
-            "콘솔은 '지금 나이스 화면'을 그대로 읽을 뿐 강의실을 바꾸지 않아요. 매 반마다 나이스에서 직접 조회하세요.\n"
-            "(읽기만 — 안전.  ※ 결시·학적변동 제외.  직전과 값이 같으면 화면 안 바꾼 걸로 보고 경고합니다.)")
+            "① 나이스 '교과담임 → 성적 → 수행평가 → 수행평가성적관리'에서 강의실(반)을 고르고 [조회]  →  "
+            "② 콘솔에서 반 번호 넣고 [현재 반 추가].  반마다 ①②를 되풀이하면 아래에 쌓입니다.\n"
+            "수행평가마다 점수·결시·학적변동이 모두 빈 학생을 이름까지 보여 줍니다. 읽는 2~3초 동안 나이스 화면이 "
+            "잠깐 커졌다 돌아옵니다(가려진 칸까지 읽으려고).  읽기만 하며, 직전과 값이 같으면 강의실을 안 바꾼 걸로 보고 경고합니다.")
         ).pack(anchor="w")
         prow = ttk.Frame(lf3); prow.pack(anchor="w", pady=6)
         ttk.Label(prow, text="반").pack(side="left")
@@ -6562,8 +6548,16 @@ class ConsoleApp:
                 anymiss = True
             lines.append("{} {} — 누락 {}명  (수강 {} / 입력 {}){}".format(
                 mark, it["assessment"], miss, it.get("total", 0), it.get("filled", 0), extra))
+            if it.get("who") and it.get("filled", 0) == 0 and len(it["who"]) >= it.get("total", 0) - it.get("gyeolsi", 0) - it.get("hakjeok", 0):
+                lines.append("      → 아직 아무도 입력 안 함")
+            elif it.get("who"):
+                lines.append("      → " + ", ".join(it["who"]))
         lines.append("✓ 누락 없음" if not anymiss else
-                     "누락 = 수강 − 입력(응시) − 결시 − 학적변동.")
+                     "누락 = 점수·결시·학적변동이 모두 빈 학생 (결시·학적변동은 누락으로 안 셈)")
+        n_read, n_total = data.get("students", 0), max([it.get("total", 0) for it in items] or [0])
+        if n_read and n_total and n_read < n_total:
+            lines.append("⚠ 학생 {}명 중 {}명만 읽었습니다 — 나머지는 이름을 못 봤으니 나이스에서 확인하세요".format(
+                n_total, n_read))
         self.perf_box.insert("end", "\n".join(lines) + "\n")
         self.perf_box.see("end")
         self.log("[{}] 수행평가 누락: {} (수행평가 {}개)".format(
