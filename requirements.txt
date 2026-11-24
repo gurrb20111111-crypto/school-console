@@ -1,3 +1,4 @@
 websocket-client>=1.6.0
 plyer>=2.1.0
 pymysql>=1.1.0
+comtypes>=1.2.0   # 기안 도우미(K-에듀파인 기안기 WXSClient 제어)

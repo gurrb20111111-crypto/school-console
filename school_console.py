@@ -47,6 +47,12 @@ except ImportError:
     HAS_WS = False
 
 try:
+    import gian_draft  # K-에듀파인 반복 기안 초안 도우미 (comtypes 필요)
+    HAS_GIAN = True
+except Exception:
+    HAS_GIAN = False
+
+try:
     import pymysql  # pip install pymysql — 알림장 전달사항을 학교 MySQL에서 직접 읽기(순수 파이썬)
     HAS_PYMYSQL = True
 except Exception:
@@ -3024,7 +3030,7 @@ class CallReplyListener(threading.Thread):
                             body = json.loads(d.get("message", ""))
                         except Exception:
                             continue
-                        if isinstance(body, dict) and (body.get("cid") or body.get("t") == "pong"):
+                        if isinstance(body, dict) and (body.get("cid") or body.get("t") in ("pong", "hello")):
                             body["_time"] = d.get("time") or int(time.time())
                             self.ui_post("call_reply", body)
             except Exception as e:
@@ -3281,7 +3287,6 @@ class ConsoleApp:
         container.pack(fill="both", expand=True, padx=12, pady=6)
 
         self.tab_today = ttk.Frame(container, padding=12)
-        self.tab_dash = ttk.Frame(container, padding=12)
         self.tab_query = ttk.Frame(container, padding=12)
         self.tab_naeis = ttk.Frame(container)     # '나이스 업무' (하위 탭 포함)
         self.tab_dday = ttk.Frame(container, padding=12)
@@ -3290,11 +3295,12 @@ class ConsoleApp:
         self.tab_comci = ttk.Frame(container, padding=12)
         self.tab_call = ttk.Frame(container, padding=12)
         self.tab_set = ttk.Frame(container, padding=12)
+        self.tab_gian = ttk.Frame(container, padding=10)
 
         # (탭이름, 프레임, 선택색(진), 평상색(연))
         tab_defs = [
             ("오늘",           self.tab_today, "#c0504d", "#f6e0de"),
-            ("세션·관제",      self.tab_dash,  "#2d6cdf", "#dce7fb"),
+            ("기안 도우미",    self.tab_gian,  "#d35400", "#f8e1d0"),
             ("컴시간 시간표",  self.tab_comci, "#8e44ad", "#ecdff3"),
             ("알림장",         self.tab_alim,  "#3f8f4f", "#d8ecdb"),
             ("급식·일정",      self.tab_meal,  "#c0693a", "#f4e0d3"),
@@ -3319,8 +3325,7 @@ class ConsoleApp:
         # '나이스 업무' 안에 하위 탭(복무·기안 템플릿 / 출결 마감) 구성
         self._build_naeis_group()
 
-        self._build_today()
-        self._build_dashboard()
+        self._build_today()          # 오늘 = 건수 카드 + 세션 유지 + 결재 관제
         self._build_query()
         self._build_template()       # → self.tab_tpl (나이스 업무 하위)
         self._build_attendance()     # → self.tab_att (나이스 업무 하위)
@@ -3330,6 +3335,7 @@ class ConsoleApp:
         self._build_comci()
         self._build_call()
         self._build_settings()
+        self._build_gian()
 
         self._select_tab(self.tab_today)      # 기본 상위 탭
         self._select_subtab(self.tab_tpl)     # 기본 하위 탭
@@ -3364,18 +3370,13 @@ class ConsoleApp:
             self.today_vars[key] = v
             tk.Label(c, textvariable=v, bg="#f4f6f8", fg=color, font=("Malgun Gothic", 32, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
 
-        self.today_session = tk.StringVar(value="세션 유지: -   ·   관제: -")
-        ttk.Label(frm, textvariable=self.today_session).pack(anchor="w")
+        self.today_session = tk.StringVar(value="세션 유지: -   ·   관제: -")   # (아래 칸에 상태가 보이므로 표시는 안 함)
+
+        self._build_dashboard(frm)               # 예전 '세션·관제' 탭을 오늘 탭 아래쪽으로 합침
         ttk.Label(frm, foreground="#888", justify="left", text=(
             "· 결재/공람·E알리미는 해당 사이트 탭이 디버그 크롬에 열려 로그인돼 있어야 읽힙니다.\n"
             "· 출결 입력은 '나이스 업무 → 출결 마감', 미마감·수행평가 누락 점검은 '조회 대시보드' 탭에서 하세요.")
-        ).pack(anchor="w", pady=(6, 0))
-
-        lf = ttk.LabelFrame(frm, text="내 기안 결재 진행 (에듀파인 '문서카드/결재경로' 화면 열고)", padding=8)
-        lf.pack(fill="both", expand=True, pady=(10, 0))
-        ttk.Button(lf, text="결재 진행 읽기", command=self.approval_track).pack(anchor="w")
-        self.approval_box = tk.Text(lf, height=8, font=("Malgun Gothic", 10))
-        self.approval_box.pack(fill="both", expand=True, pady=(6, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
     def toggle_tts(self):
         global TTS_ENABLED
@@ -3424,38 +3425,1031 @@ class ConsoleApp:
         self.today_session.set("세션 유지: {}   ·   관제: {}".format(sess, mon))
         self.today_updated.set("· 갱신 " + datetime.now().strftime("%H:%M:%S"))
 
-    def approval_track(self):
-        if not HAS_WS:
-            messagebox.showerror("오류", "websocket-client가 필요합니다.")
+    # ===================== 기안 도우미 (K-에듀파인 반복 기안) =====================
+    #  예전 기안문을 [재작성]으로 열고 바뀌는 부분만 바꿔 '결재올림 직전'까지 만든다.
+    #  결재올림·임시저장은 코드가 누르지 않는다(gian_draft.FORBIDDEN_JS로 막아 둠).
+    def _build_gian(self):
+        frm = self.tab_gian
+        self.gian_groups, self.gian_win, self.gian_vars = [], None, []
+        self._gian_orig_title = ""
+
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        ttk.Button(top, text="① 기안한문서 읽기", command=self.gian_load).pack(side="left")
+        ttk.Button(top, text="② 재작성 창 열기", command=self.gian_open).pack(side="left", padx=4)
+        ttk.Button(top, text="열린 기안 창 읽기", command=self.gian_read_open).pack(side="left", padx=4)
+        self.gian_status = tk.StringVar(value="에듀파인 [기안한문서] 화면을 한 번 열어 둔 뒤 ①을 누르세요.")
+        ttk.Label(top, textvariable=self.gian_status, foreground="#8a4b14").pack(side="left", padx=10)
+
+        pw = ttk.PanedWindow(frm, orient="horizontal")
+        pw.pack(fill="both", expand=True, pady=(6, 0))
+
+        # 왼쪽: 반복 기안 묶음 + 원본 문서 선택
+        left = ttk.Frame(pw)
+        pw.add(left, weight=2)
+        self.gian_gtree = ttk.Treeview(left, columns=("n", "name"), show="headings", height=9)
+        self.gian_gtree.heading("n", text="횟수")
+        self.gian_gtree.heading("name", text="자주 올린 기안 (최근 문서를 원본으로)")
+        self.gian_gtree.column("n", width=40, anchor="center", stretch=False)
+        self.gian_gtree.column("name", width=300)
+        self.gian_gtree.pack(fill="both", expand=True)
+        self.gian_gtree.bind("<<TreeviewSelect>>", self._gian_pick_group)
+        ttk.Label(left, text="원본 문서").pack(anchor="w", pady=(6, 0))
+        self.gian_src = tk.StringVar()
+        self.gian_src_cb = ttk.Combobox(left, textvariable=self.gian_src, state="readonly")
+        self.gian_src_cb.pack(fill="x")
+
+        # 오른쪽: [바뀌는 값] / [붙임 파일] 두 장
+        nb = ttk.Notebook(pw)
+        pw.add(nb, weight=3)
+        self.gian_nb = nb
+        right = ttk.Frame(nb, padding=4)
+        nb.add(right, text=" 바뀌는 값 ")
+        attf = ttk.Frame(nb, padding=4)
+        nb.add(attf, text=" 붙임 파일 ")
+        self._build_gian_att(attf)
+        stdf = ttk.Frame(nb, padding=4)
+        nb.add(stdf, text=" 표준 점검 ")
+        self._build_gian_std(stdf)
+        casef = ttk.Frame(nb, padding=4)
+        nb.add(casef, text=" 사안 카드 ")
+        self._build_gian_case(casef)
+        self.gian_vtree = ttk.Treeview(right, columns=("label", "old", "new"), show="headings", height=8)
+        for c, t, w in (("label", "항목", 80), ("old", "원본 값", 210), ("new", "새 값", 210)):
+            self.gian_vtree.heading(c, text=t)
+            self.gian_vtree.column(c, width=w)
+        self.gian_vtree.tag_configure("chg", background="#fff1c9")
+        self.gian_vtree.pack(fill="both", expand=True)
+        self.gian_vtree.bind("<<TreeviewSelect>>", self._gian_pick_var)
+
+        ed = ttk.Frame(right)
+        ed.pack(fill="x", pady=(4, 0))
+        ttk.Label(ed, text="새 값").pack(side="left")
+        self.gian_new = tk.StringVar()
+        ent = ttk.Entry(ed, textvariable=self.gian_new)
+        ent.pack(side="left", fill="x", expand=True, padx=4)
+        ent.bind("<Return>", lambda e: self._gian_set_new())
+        ttk.Button(ed, text="반영(Enter)", command=self._gian_set_new).pack(side="left")
+        ttk.Button(ed, text="행 추가", command=self._gian_add_pair).pack(side="left", padx=2)
+        ttk.Button(ed, text="행 삭제", command=self._gian_del_pair).pack(side="left")
+
+        tl = ttk.Frame(right)
+        tl.pack(fill="x", pady=(4, 0))
+        ttk.Label(tl, text="새 제목").pack(side="left")
+        self.gian_title = tk.StringVar()
+        ttk.Entry(tl, textvariable=self.gian_title).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(tl, text="③ 초안에 적용", command=self.gian_apply).pack(side="left")
+
+        boxf = ttk.Frame(frm)
+        boxf.pack(fill="x", pady=(6, 0))
+        self.gian_box = tk.Text(boxf, height=9, font=("Malgun Gothic", 9), wrap="word")
+        sb = ttk.Scrollbar(boxf, orient="vertical", command=self.gian_box.yview)
+        self.gian_box.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.gian_box.pack(side="left", fill="x", expand=True)
+        self.gian_box.insert("1.0", "사용 순서: ① 기안한문서 읽기 → 왼쪽에서 기안 종류 선택 → ② 재작성 창 열기 → "
+                             "오른쪽 표에서 바뀌는 값만 고치기(노란 줄) → ③ 초안에 적용 → [붙임 파일] 장에서 "
+                             "새 사안 파일 폴더 고르기 → ④ 붙임 바꿔 끼우기.\n"
+                             "결재경로·수신자·공개여부·첨부는 원본에서 그대로 따라옵니다. 관련 학생 표는 기안 창에서 "
+                             "직접 확인한 뒤, [결재올림]은 선생님이 누르세요. 콘솔은 결재올림을 누르지 않습니다.")
+        if not HAS_GIAN:
+            self.gian_status.set("comtypes가 필요합니다:  pip install comtypes  (설치 후 콘솔 재시작)")
+
+    # ---------- 기안 도우미: 붙임 파일 ----------
+    #  재작성은 원본 문서의 첨부를 그대로 복사해 온다 → 옛 사안 파일을 새 사안 파일로 바꿔 끼운다.
+    #  폴더를 고르면 '옛 파일명에 바뀌는 값을 적용한 이름'으로 새 파일을 찾아 짝지어 준다.
+    def _build_gian_att(self, frm):
+        self.gian_att_rows, self.gian_butim = [], []
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        ttk.Button(top, text="새 파일 폴더…", command=self.gian_att_pick_folder).pack(side="left")
+        self.gian_att_dir = tk.StringVar(value=(self.cfg.get("gian", {}) or {}).get("attach_dir", ""))
+        ttk.Label(top, textvariable=self.gian_att_dir, foreground="#555").pack(side="left", padx=6)
+
+        self.gian_atree = ttk.Treeview(frm, columns=("no", "old", "new", "act"), show="headings", height=8)
+        for c, t, w in (("no", "#", 28), ("old", "지금 첨부", 220), ("new", "→ 바꿔 넣을 파일", 220), ("act", "처리", 70)):
+            self.gian_atree.heading(c, text=t)
+            self.gian_atree.column(c, width=w, stretch=(c in ("old", "new")), anchor="center" if c in ("no", "act") else "w")
+        self.gian_atree.tag_configure("chg", background="#fff1c9")
+        self.gian_atree.tag_configure("bad", background="#fbdcdc")
+        self.gian_atree.tag_configure("del", foreground="#999")
+        self.gian_atree.pack(fill="both", expand=True, pady=(4, 0))
+
+        bt = ttk.Frame(frm)
+        bt.pack(fill="x", pady=(4, 0))
+        ttk.Button(bt, text="이 행 파일 지정…", command=self.gian_att_pick_file).pack(side="left")
+        ttk.Button(bt, text="유지/빼기", command=self.gian_att_toggle).pack(side="left", padx=2)
+        ttk.Button(bt, text="파일 추가…", command=self.gian_att_add).pack(side="left")
+        ttk.Button(bt, text="▲", width=3, command=lambda: self.gian_att_move(-1)).pack(side="left", padx=(6, 0))
+        ttk.Button(bt, text="▼", width=3, command=lambda: self.gian_att_move(1)).pack(side="left")
+        ttk.Button(bt, text="④ 붙임 바꿔 끼우기", command=self.gian_att_apply).pack(side="right")
+
+    def _gian_pairs(self):
+        """원본 기안 기준 치환표 (③ 적용 뒤에도 처음 원본 → 지금 새 값)."""
+        return [(v.get("orig", v["old"]), v["new"]) for v in self.gian_vars if v.get("orig", v["old"]) != v["new"]]
+
+    def _gian_att_load(self, atts, butim):
+        self.gian_butim = butim
+        self.gian_att_rows = [{"old": a["name"], "path": None, "act": "유지", "how": ""} for a in atts]
+        if self.gian_att_dir.get():
+            self._gian_att_match(quiet=True)
+        else:
+            self._gian_att_render()
+
+    def _gian_att_match(self, quiet=False):
+        """폴더에서 짝 찾기 (사람이 직접 지정한 행은 건드리지 않음)."""
+        olds = [{"name": r["old"]} for r in self.gian_att_rows if r["old"] and r["how"] != "직접"]
+        rows, extras = gian_draft.match_attachments(olds, self._gian_pairs(), self.gian_att_dir.get())
+        by_old = {x["old"]: x for x in rows}
+        for r in self.gian_att_rows:
+            x = by_old.get(r["old"])
+            if not x or r["how"] == "직접" or r["act"] == "빼기":
+                continue
+            if x["path"]:
+                r.update(path=x["path"], act="교체", how=x["how"])
+            elif x["how"] == "없음":
+                r.update(path=None, act="유지", how="새 파일 못 찾음")
+            else:
+                r.update(path=None, act="유지", how="")
+        have = {r["path"] for r in self.gian_att_rows if r["path"]}
+        extras = [p for p in extras if p not in have]
+        self._gian_att_render()
+        if extras and not quiet:
+            names = "\n".join(os.path.basename(p) for p in extras[:8])
+            if messagebox.askyesno("붙임 파일", "폴더에 새 사안 표시가 있는데 짝이 없는 파일이 있습니다:\n\n{}\n\n추가할까요?".format(names)):
+                for p in extras:
+                    self.gian_att_rows.append({"old": None, "path": p, "act": "추가", "how": "폴더"})
+                self._gian_att_render()
+
+    def _gian_att_render(self):
+        keep = self.gian_atree.selection()
+        self.gian_atree.delete(*self.gian_atree.get_children())
+        n = 0
+        for i, r in enumerate(self.gian_att_rows):
+            if r["act"] != "빼기":
+                n += 1
+            new = os.path.basename(r["path"]) if r["path"] else ("(빼기)" if r["act"] == "빼기" else (r["how"] or "그대로"))
+            tag = ("del",) if r["act"] == "빼기" else ("chg",) if r["act"] in ("교체", "추가") else \
+                  ("bad",) if r["how"] == "새 파일 못 찾음" else ()
+            act = r["act"] + ("" if not r["how"] or r["how"] in ("직접", "폴더", "새 파일 못 찾음") else " " + r["how"][:6])
+            self.gian_atree.insert("", "end", iid=str(i), tags=tag,
+                                   values=("" if r["act"] == "빼기" else n, r["old"] or "(새로 추가)", new, act))
+        if keep and keep[0] in self.gian_atree.get_children():
+            self.gian_atree.selection_set(keep[0])
+
+    def _gian_att_sel(self):
+        sel = self.gian_atree.selection()
+        return int(sel[0]) if sel else None
+
+    def gian_att_pick_folder(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="새 사안 붙임 파일이 든 폴더", initialdir=self.gian_att_dir.get() or str(Path.home()))
+        if not d:
             return
-        match = next((m["match"] for m in self.cfg.get("monitors", []) if m.get("type") == "edufine"), "klef.sen.go.kr")
-        self.approval_box.delete("1.0", "end")
-        self.approval_box.insert("1.0", "읽는 중…")
+        self.gian_att_dir.set(os.path.normpath(d))
+        self.cfg.setdefault("gian", {})["attach_dir"] = self.gian_att_dir.get()
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+        if self.gian_att_rows:
+            self._gian_att_match()
+
+    def gian_att_pick_file(self):
+        from tkinter import filedialog
+        i = self._gian_att_sel()
+        if i is None:
+            messagebox.showinfo("붙임 파일", "바꿀 첨부 행을 먼저 고르세요.")
+            return
+        p = filedialog.askopenfilename(title="이 첨부 대신 넣을 파일", initialdir=self.gian_att_dir.get() or str(Path.home()))
+        if p:
+            r = self.gian_att_rows[i]
+            r.update(path=os.path.normpath(p), act="교체" if r["old"] else "추가", how="직접")
+            self._gian_att_render()
+
+    def gian_att_toggle(self):
+        i = self._gian_att_sel()
+        if i is None:
+            return
+        r = self.gian_att_rows[i]
+        if r["old"] is None:                      # 새로 추가한 행 → 목록에서 지움
+            del self.gian_att_rows[i]
+        elif r["act"] == "빼기":
+            r.update(act="교체" if r["path"] else "유지")
+        elif r["act"] == "교체":
+            r.update(act="유지", path=None, how="")
+        else:
+            r.update(act="빼기")
+        self._gian_att_render()
+
+    def gian_att_add(self):
+        from tkinter import filedialog
+        ps = filedialog.askopenfilenames(title="추가로 붙일 파일", initialdir=self.gian_att_dir.get() or str(Path.home()))
+        for p in ps:
+            self.gian_att_rows.append({"old": None, "path": os.path.normpath(p), "act": "추가", "how": "직접"})
+        self._gian_att_render()
+
+    def gian_att_move(self, d):
+        i = self._gian_att_sel()
+        if i is None or not (0 <= i + d < len(self.gian_att_rows)):
+            return
+        rows = self.gian_att_rows
+        rows[i], rows[i + d] = rows[i + d], rows[i]
+        self._gian_att_render()
+        self.gian_atree.selection_set(str(i + d))
+
+    def gian_att_apply(self):
+        if not self.gian_win:
+            messagebox.showinfo("붙임 파일", "먼저 ② 재작성 창 열기(또는 열린 기안 창 읽기)를 하세요.")
+            return
+        plan = [{"old": r["old"], "path": r["path"], "act": r["act"]} for r in self.gian_att_rows]
+        if not any(r["act"] != "유지" for r in plan):
+            messagebox.showinfo("붙임 파일", "바꿀 첨부가 없습니다. 폴더를 고르거나 행마다 파일을 지정하세요.")
+            return
+        missing = [r["old"] for r in self.gian_att_rows if r["how"] == "새 파일 못 찾음" and r["act"] == "유지"]
+        msg = "\n".join("{}  {}{}".format(r["act"], r["old"] or "", (" → " + os.path.basename(r["path"])) if r["path"] else "")
+                        for r in self.gian_att_rows if r["act"] != "유지")
+        if missing:
+            msg += "\n\n⚠ 새 파일을 못 찾아 옛 파일 그대로 두는 첨부:\n" + "\n".join(missing)
+        if not messagebox.askyesno("붙임 바꿔 끼우기", "기안 창의 첨부를 이렇게 바꿉니다:\n\n" + msg + "\n\n진행할까요?"):
+            return
+        self.gian_status.set("붙임 바꿔 끼우는 중…")
+        ie, top = self.gian_win
 
         def work():
-            rows, status = do_read_approval_path(self._port(), match)
-            self.ui_post("approval", {"rows": rows, "status": status})
+            try:
+                res = gian_draft.replace_attachments(ie, top, plan)
+                if res.get("ok"):
+                    data = gian_draft.read_gianki(ie, top)
+                    res["butim"] = data["butim"]
+            except Exception as e:
+                res = {"ok": False, "err": str(e)}
+            self.ui_post("gian_att", res)
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_approval(self, payload):
-        self.approval_box.delete("1.0", "end")
-        rows = payload["rows"]
-        if rows is None:
-            self.approval_box.insert("1.0", "결과 없음 ({}). 에듀파인 문서카드(결재경로) 화면을 연 상태인지 확인하세요.".format(payload["status"]))
+    def _show_gian_att(self, r):
+        if not r.get("ok"):
+            self.gian_status.set("⚠ 붙임 교체 실패: {}".format(r.get("err")))
+            if r.get("problems"):
+                messagebox.showwarning("붙임 파일", "첨부할 수 없는 파일:\n\n" + "\n".join(r["problems"]))
             return
-        if not rows:
-            self.approval_box.insert("1.0", "결재경로를 찾지 못했습니다. 문서를 열어 '결재정보/결재경로'가 보이게 한 뒤 다시 시도하세요.")
+        self.gian_att_rows = [{"old": a["name"], "path": None, "act": "유지", "how": ""} for a in r["atts"]]
+        self._gian_att_render()
+        pairs, left = gian_draft.compare_butim(r.get("butim", []), r["atts"])
+        lines = ["[{}] 붙임 교체 완료 — 뺀 것 {}개, 넣은 것 {}개{}".format(
+            r["at"], r["removed"], r["added"], "" if r["order_ok"] else "  ⚠ 순서 확인 필요"), "",
+            "본문 '붙임' 목록 ↔ 실제 첨부 대조:"]
+        for b, hit in pairs:
+            lines.append("  {} {}{}".format("✓" if hit else "⚠", b, "" if hit else "  ← 맞는 첨부 없음"))
+        for n in left:
+            lines.append("  ⚠ 본문 붙임에 없는 첨부: " + n)
+        if not pairs:
+            lines.append("  (본문에서 붙임 목록을 찾지 못함)")
+        for a in r.get("alerts", []):
+            lines.append("⚠ 에듀파인 알림: " + a)
+        lines.append("")
+        lines.append("기안 창의 [결재정보] 탭 첨부 목록을 눈으로 확인한 뒤 [결재올림]은 직접 누르세요.")
+        self.gian_box.delete("1.0", "end")
+        self.gian_box.insert("1.0", "\n".join(lines))
+        ok = all(h for _b, h in pairs) and not left and r["order_ok"]
+        self.gian_status.set("붙임 교체 완료 — " + ("본문 붙임과 일치 ✓" if ok else "대조 결과에 ⚠ 있음, 확인 필요"))
+        self.log("[{}] 기안 도우미: 붙임 교체 (뺌 {}, 넣음 {})".format(r["at"], r["removed"], r["added"]))
+
+    # ---------- 기안 도우미: 사안 카드 ----------
+    #  사안번호마다 단계(접수→개최→결과 보고→자체해결/심의 요청→조치 이행)를 모아 보여 주고,
+    #  [이 단계 초안 만들기] = 그 단계의 가장 최근 기안을 재작성 + 사안번호·관련 문서·카드 값을 '새 값'에 미리 채움.
+    #  카드 파일(gian_cases.json)에는 사안번호·종결 여부·선생님이 적은 값(접수 일시 등)만 둔다(PC 안에만).
+    GIAN_CASE_PATH = APP_DIR / "gian_cases.json"
+
+    def _build_gian_case(self, frm):
+        self.gian_cases_saved = gian_draft.load_cases(self.GIAN_CASE_PATH) if HAS_GIAN else {}
+        self.gian_case_rows, self.gian_case_list, self._gian_case_stages = [], [], []
+        self._gian_case_ctx = None
+        self._gian_case_active = None
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        ttk.Button(top, text="사안 읽기", command=self.gian_case_load).pack(side="left")
+        ttk.Button(top, text="새 사안", command=self.gian_case_new).pack(side="left", padx=3)
+        ttk.Button(top, text="종결 / 다시 열기", command=self.gian_case_toggle).pack(side="left")
+
+        self.gian_ctree = ttk.Treeview(frm, columns=("case", "last", "days", "next"), show="headings", height=4)
+        for c, t, w in (("case", "사안번호", 110), ("last", "마지막 단계", 140), ("days", "접수 후", 55),
+                        ("next", "다음 할 일", 230)):
+            self.gian_ctree.heading(c, text=t)
+            self.gian_ctree.column(c, width=w, stretch=(c == "next"), anchor="center" if c == "days" else "w")
+        self.gian_ctree.tag_configure("closed", foreground="#999999")
+        self.gian_ctree.tag_configure("todo", background="#fff1c9")
+        self.gian_ctree.pack(fill="x", pady=(4, 0))
+        self.gian_ctree.bind("<<TreeviewSelect>>", self._gian_case_pick)
+
+        self.gian_sttree = ttk.Treeview(frm, columns=("name", "docno", "date", "state"), show="headings", height=6)
+        for c, t, w in (("name", "단계", 170), ("docno", "문서번호", 120), ("date", "기안일 (결재)", 120),
+                        ("state", "상태", 70)):
+            self.gian_sttree.heading(c, text=t)
+            self.gian_sttree.column(c, width=w, stretch=(c == "name"), anchor="w" if c in ("name", "docno") else "center")
+        self.gian_sttree.tag_configure("next", background="#fff1c9")
+        self.gian_sttree.tag_configure("done", foreground="#1f6f3a")
+        self.gian_sttree.tag_configure("none", foreground="#999999")
+        self.gian_sttree.pack(fill="both", expand=True, pady=(4, 0))
+        self.gian_sttree.bind("<<TreeviewSelect>>", self._gian_case_stage_pick)
+        ttk.Button(frm, text="이 단계 초안 만들기 (재작성 → 값 미리 채움)",
+                   command=self.gian_case_draft).pack(anchor="e", pady=(3, 0))
+
+        ttk.Label(frm, text="카드에 적어 둔 값 — 초안을 만들 때 같은 항목에 자동으로 넣고, ③ 적용한 값은 여기 저장됩니다",
+                  foreground="#777").pack(anchor="w", pady=(4, 0))
+        self.gian_cvtree = ttk.Treeview(frm, columns=("label", "value"), show="headings", height=3)
+        self.gian_cvtree.heading("label", text="항목")
+        self.gian_cvtree.heading("value", text="값")
+        self.gian_cvtree.column("label", width=110, stretch=False)
+        self.gian_cvtree.column("value", width=360)
+        self.gian_cvtree.pack(fill="x")
+        self.gian_cvtree.bind("<<TreeviewSelect>>", self._gian_case_var_pick)
+        ed = ttk.Frame(frm)
+        ed.pack(fill="x", pady=(2, 0))
+        self.gian_cv_label, self.gian_cv_value = tk.StringVar(), tk.StringVar()
+        ttk.Entry(ed, textvariable=self.gian_cv_label, width=12).pack(side="left")
+        ttk.Entry(ed, textvariable=self.gian_cv_value).pack(side="left", fill="x", expand=True, padx=3)
+        ttk.Button(ed, text="넣기·고치기", command=self.gian_case_var_set).pack(side="left")
+        ttk.Button(ed, text="빼기", command=self.gian_case_var_del).pack(side="left", padx=(3, 0))
+
+    def _gian_case_save(self):
+        try:
+            gian_draft.save_cases(self.GIAN_CASE_PATH, self.gian_cases_saved)
+        except Exception as e:
+            self.log("사안 카드 저장 실패: {}".format(e))
+
+    def gian_case_load(self):
+        if not (HAS_WS and HAS_GIAN):
+            messagebox.showerror("오류", "websocket-client와 comtypes가 필요합니다.")
             return
-        lines = ["[결재 진행]  ({})".format(datetime.now().strftime("%H:%M:%S")), "-" * 50]
-        cur = False
-        for r in rows:
-            st = r.get("state", "")
-            mark = " "
-            if not cur and st and ("완료" not in st and "승인" not in st):
-                mark, cur = "▶", True
-            lines.append("{} {:>2} {}  {}  {}".format(mark, r.get("no", ""), r.get("method", ""), r.get("who", ""), st))
-        lines.append("\n▶ = 현재 대기/진행 중인 단계" if cur else "\n✓ 모든 단계 완료")
-        self.approval_box.insert("1.0", "\n".join(lines))
+        self.gian_status.set("기안한문서에서 사안별 기안 읽는 중… (읽기만)")
+
+        def prog(i, n):
+            self.ui_post("gian_prog", "사안 기안 본문 읽는 중… {}/{} (읽기만)".format(i, n))
+
+        def work():
+            try:
+                rows, st = gian_draft.read_doc_meta(self._port(), find_target_page, CDP, with_body=True, progress=prog)
+            except Exception as e:
+                rows, st = None, str(e)
+            self.ui_post("gian_case", {"rows": rows, "status": st})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_case(self, p):
+        if not p["rows"]:
+            self.gian_status.set("⚠ " + p["status"])
+            return
+        self.gian_case_rows = p["rows"]
+        self._gian_case_refresh()
+        n_open = sum(1 for c in self.gian_case_list if not c["closed"])
+        self.gian_status.set("사안 {}건 (진행 중 {}건) — {}. 사안을 고르고 노란 단계에서 '초안 만들기'".format(
+            len(self.gian_case_list), n_open, p["status"]))
+
+    def _gian_case_refresh(self, keep=None):
+        keep = keep or (self._gian_case_sel() or {}).get("case")
+        self.gian_case_list = gian_draft.build_cases(self.gian_case_rows, self.gian_cases_saved)
+        self.gian_ctree.delete(*self.gian_ctree.get_children())
+        for i, c in enumerate(self.gian_case_list):
+            last = gian_draft.stage_name(c["last"]) if c["last"] else "(아직 없음)"
+            nxt = "종결" if c["closed"] else (" 또는 ".join(gian_draft.stage_name(k) for k in c["next"]) or "-")
+            days = "{}일".format(c["days"]) if c["days"] != "" else ""
+            self.gian_ctree.insert("", "end", iid=str(i), values=(c["case"], last, days, nxt),
+                                   tags=("closed",) if c["closed"] else ("todo",) if c["next"] else ())
+        idx = next((i for i, c in enumerate(self.gian_case_list) if c["case"] == keep), None)
+        if idx is not None:
+            self.gian_ctree.selection_set(str(idx))
+            self.gian_ctree.see(str(idx))
+        else:
+            self.gian_sttree.delete(*self.gian_sttree.get_children())
+            self.gian_cvtree.delete(*self.gian_cvtree.get_children())
+
+    def _gian_case_sel(self):
+        sel = self.gian_ctree.selection() if hasattr(self, "gian_ctree") else ()
+        return self.gian_case_list[int(sel[0])] if sel and int(sel[0]) < len(self.gian_case_list) else None
+
+    def _gian_case_pick(self, _e=None):
+        c = self._gian_case_sel()
+        if not c:
+            return
+        self._gian_case_stages = gian_draft.case_stages(c)
+        self.gian_sttree.delete(*self.gian_sttree.get_children())
+        first_next = None
+        for i, s in enumerate(self._gian_case_stages):
+            d = ""
+            if s["draft"]:
+                d = "{}-{}".format(s["draft"][4:6], s["draft"][6:8])
+                if s["done"] and s["done"] != s["draft"]:
+                    d += " ({}-{})".format(s["done"][4:6], s["done"][6:8])
+            tag = "next" if s["state"] == "다음" else "done" if s["state"].startswith("완료") else "none"
+            if tag == "next" and first_next is None:
+                first_next = i
+            self.gian_sttree.insert("", "end", iid=str(i), tags=(tag,),
+                                    values=(s["name"], s["docno"], d, s["state"] or "-"))
+        self._gian_case_render_vars(c)
+        if first_next is not None:
+            self.gian_sttree.selection_set(str(first_next))      # → _gian_case_stage_pick 이 계획을 보여 줌
+        else:
+            self.gian_box.delete("1.0", "end")
+            self.gian_box.insert("1.0", "[{}] {} — 문서 {}건{}".format(
+                c["case"], "종결" if c["closed"] else "진행 중", len(c["docs"]),
+                "" if self.gian_case_rows else "  ('사안 읽기'를 누르면 올린 기안이 단계별로 나옵니다)"))
+
+    def _gian_case_render_vars(self, c):
+        self.gian_cvtree.delete(*self.gian_cvtree.get_children())
+        for i, (k, v) in enumerate(sorted(self.gian_cases_saved.get(c["case"], {}).get("vars", {}).items())):
+            self.gian_cvtree.insert("", "end", iid=str(i), values=(k, v))
+
+    def _gian_case_stage(self):
+        sel = self.gian_sttree.selection()
+        return self._gian_case_stages[int(sel[0])] if sel and int(sel[0]) < len(self._gian_case_stages) else None
+
+    def _gian_case_stage_pick(self, _e=None):
+        c, s = self._gian_case_sel(), self._gian_case_stage()
+        if not (c and s):
+            return
+        lines = ["[{}] {} — {}".format(c["case"], s["name"], s["state"] or "아직 안 올림")]
+        if not self.gian_case_rows:
+            lines.append("먼저 [사안 읽기]를 누르세요.")
+        else:
+            p = gian_draft.plan_stage(self.gian_case_rows, c["case"], s["key"])
+            if p.get("err"):
+                lines.append(p["err"])
+            else:
+                lines.append("초안 원본: {} '{}' (이 단계의 가장 최근 기안)".format(p["src"], p["src_title"]))
+                for pr in p["pairs"]:
+                    if pr["old"] != pr["new"]:
+                        lines.append("  · {}: '{}' → '{}'".format(pr["label"], pr["old"], pr["new"]))
+                lines += ["  " + n for n in p["notes"] if n.startswith("⚠")]
+                cv = self.gian_cases_saved.get(c["case"], {}).get("vars", {})
+                if cv:
+                    lines.append("  · 카드 값도 같은 항목에 채움: " + ", ".join(cv))
+                lines.append("→ [이 단계 초안 만들기]를 누르면 재작성 창을 열고 위 값을 '바뀌는 값'에 미리 넣습니다. "
+                             "남은 값(일시·학생 등)을 확인하고 ③ 적용 → 붙임 → 표준 점검 → 결재올림은 직접.")
+        self.gian_box.delete("1.0", "end")
+        self.gian_box.insert("1.0", "\n".join(lines))
+
+    def gian_case_new(self):
+        from tkinter import simpledialog
+        known = [c["case"] for c in self.gian_case_list] or list(self.gian_cases_saved)
+        no = simpledialog.askstring("새 사안", "사안번호 (예: 우리중-2026-11)",
+                                    initialvalue=gian_draft.next_case_no(known), parent=self.root)
+        no = (no or "").strip()
+        if not no:
+            return
+        if not gian_draft._CASENO_RE.fullmatch(no):
+            messagebox.showwarning("새 사안", "'학교-연도-번호' 꼴로 적어 주세요 (예: 우리중-2026-11).")
+            return
+        self.gian_cases_saved.setdefault(no, {"vars": {}, "created": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        self._gian_case_save()
+        self._gian_case_refresh(keep=no)
+        self.gian_status.set("사안 {} 카드를 만들었습니다 — '사안 접수' 단계에서 초안 만들기".format(no))
+
+    def gian_case_toggle(self):
+        c = self._gian_case_sel()
+        if not c:
+            return
+        self.gian_cases_saved.setdefault(c["case"], {"vars": {}})["closed"] = not c["closed"]
+        self._gian_case_save()
+        self._gian_case_refresh(keep=c["case"])
+
+    def _gian_case_var_pick(self, _e=None):
+        sel = self.gian_cvtree.selection()
+        if sel:
+            k, v = self.gian_cvtree.item(sel[0], "values")
+            self.gian_cv_label.set(k)
+            self.gian_cv_value.set(v)
+
+    def gian_case_var_set(self):
+        c = self._gian_case_sel()
+        k, v = self.gian_cv_label.get().strip(), self.gian_cv_value.get().strip()
+        if not (c and k):
+            return
+        self.gian_cases_saved.setdefault(c["case"], {"vars": {}}).setdefault("vars", {})[k] = v
+        self._gian_case_save()
+        self._gian_case_render_vars(c)
+
+    def gian_case_var_del(self):
+        c = self._gian_case_sel()
+        k = self.gian_cv_label.get().strip()
+        if c and k:
+            self.gian_cases_saved.get(c["case"], {}).get("vars", {}).pop(k, None)
+            self._gian_case_save()
+            self._gian_case_render_vars(c)
+
+    def gian_case_draft(self):
+        c, s = self._gian_case_sel(), self._gian_case_stage()
+        if not (c and s):
+            messagebox.showinfo("사안 카드", "사안과 단계를 먼저 고르세요.")
+            return
+        if not self.gian_case_rows:
+            messagebox.showinfo("사안 카드", "먼저 [사안 읽기]를 누르세요.")
+            return
+        p = gian_draft.plan_stage(self.gian_case_rows, c["case"], s["key"])
+        if p.get("err"):
+            messagebox.showinfo("사안 카드", p["err"])
+            return
+        if s["state"].startswith("완료") and not messagebox.askyesno(
+                "사안 카드", "{} '{}' 단계는 이미 {}로 올렸습니다. 그래도 새 초안을 만들까요?".format(
+                    c["case"], s["name"], s["docno"])):
+            return
+        chg = ["{}: {} → {}".format(x["label"], x["old"], x["new"]) for x in p["pairs"] if x["old"] != x["new"]]
+        warn = [n for n in p["notes"] if n.startswith("⚠")]
+        if not messagebox.askyesno("사안 카드 — 초안 만들기", "{} '{}' 초안을 만듭니다.\n\n원본: {}\n{}\n\n{}{}"
+                                   "재작성 창을 열고 값만 미리 채웁니다(③ 적용은 선생님이). 결재올림은 하지 않습니다.".format(
+                                       c["case"], s["name"], p["src_title"], p["src"], "\n".join(chg) + "\n" if chg else "",
+                                       "\n".join(warn) + "\n\n" if warn else "")):
+            return
+        self._gian_case_ctx = {"case": c["case"], "key": s["key"], "name": s["name"], "plan": p,
+                               "vars": dict(self.gian_cases_saved.get(c["case"], {}).get("vars", {}))}
+        self.gian_open(docno=p["src"])
+
+    def _gian_case_prefill(self, ctx, text):
+        """재작성 창이 열린 뒤: 계획한 값과 카드 값을 '새 값'에 넣는다 (적용은 선생님이 ③)."""
+        filled, warn = [], []
+        for pr in ctx["plan"]["pairs"]:
+            old = pr["old"]
+            if old not in text:                       # 본문 글자와 띄어쓰기만 다를 때 실제 글자로 맞춤
+                m = re.search(r"\s*".join(re.escape(ch) for ch in old.replace(" ", "")), text)
+                if m:
+                    old = m.group(0)
+                elif old not in self._gian_orig_title:
+                    warn.append("⚠ '{}'을 기안 창에서 찾지 못했습니다 — 직접 확인".format(pr["old"]))
+                    continue
+            v = next((v for v in self.gian_vars if v["old"] == old), None)
+            if v is None:
+                v = {"label": pr["label"], "old": old, "new": old, "orig": old}
+                self.gian_vars.insert(0, v)
+            elif pr["label"].startswith("관련"):
+                v["label"] = pr["label"]
+            v["new"] = pr["new"]
+            if pr["old"] != pr["new"]:
+                filled.append("{}: '{}' → '{}'".format(pr["label"], old, v["new"]))
+        # 관련 줄 통째로 바꾸는 값이 있으면, 그 안에 든 문서번호·날짜 조각(다른 곳엔 없는 것)은 표에서 숨김
+        whole = [v for v in self.gian_vars if v["label"].startswith("관련 문서")]
+        self.gian_vars = [v for v in self.gian_vars if not any(
+            v is not w and v["new"] == v["old"] and v["old"] in w["old"] and text.count(v["old"]) <= text.count(w["old"])
+            for w in whole)]
+        for v in self.gian_vars:
+            val = ctx["vars"].get(v["label"])
+            if val and v["new"] == v["old"] and val != v["old"]:
+                v["new"] = val
+                filled.append("{} (카드 값): '{}' → '{}'".format(v["label"], v["old"], val))
+        self._gian_render_vars()
+        head = ["[사안 카드] {} '{}' 초안 — 원본 {}".format(ctx["case"], ctx["name"], ctx["plan"]["src"]),
+                "미리 채운 값 (노란 줄, 아직 기안 창엔 안 들어감 → 확인 후 ③ 초안에 적용):"]
+        head += ["  ✓ " + f for f in filled] or ["  (없음)"]
+        head += ["  " + n for n in ctx["plan"]["notes"] if n.startswith("⚠")] + ["  " + w for w in warn]
+        head.append("남은 값(일시·장소·관련 학생 등)은 표에서 직접 고치세요. 관련 학생 표는 기안 창에서 확인.")
+        return head
+
+    # ---------- 기안 도우미: 표준 점검 ----------
+    #  과거 기안을 서버 조회로 읽어 종류별 표준(결재선·과제카드·공개·열람제한·수신·첨부)을 제안 →
+    #  선생님이 확정 → 재작성 창을 열 때마다 자동 대조. 공개·열람제한은 버튼으로 표준대로 맞춤.
+    GIAN_STD_PATH = APP_DIR / "gian_standards.json"
+
+    def _build_gian_std(self, frm):
+        self.gian_stds = gian_draft.load_standards(self.GIAN_STD_PATH) if HAS_GIAN else {}
+        self._gian_std_keys = []
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        ttk.Button(top, text="표준 만들기·갱신", command=self.gian_std_build).pack(side="left")
+        ttk.Button(top, text="열린 창 점검", command=self.gian_std_check).pack(side="left", padx=3)
+        ttk.Button(top, text="공개·열람제한 맞추기", command=self.gian_std_fix).pack(side="left")
+
+        self.gian_stree = ttk.Treeview(frm, columns=("name", "n", "st", "sp"), show="headings", height=5)
+        for c, t, w in (("name", "기안 종류", 260), ("n", "건수", 40), ("st", "표준", 50), ("sp", "들쭉날쭉", 60)):
+            self.gian_stree.heading(c, text=t)
+            self.gian_stree.column(c, width=w, stretch=(c == "name"), anchor="w" if c == "name" else "center")
+        self.gian_stree.tag_configure("warn", background="#fff1c9")
+        self.gian_stree.tag_configure("done", foreground="#1f6f3a")
+        self.gian_stree.pack(fill="both", expand=True, pady=(4, 0))
+        self.gian_stree.bind("<<TreeviewSelect>>", self._gian_std_pick)
+
+        g = ttk.Frame(frm)
+        g.pack(fill="x", pady=(4, 0))
+        self.gian_std_cb = {}
+        for i, (f, label) in enumerate(gian_draft.FIELDS if HAS_GIAN else []):
+            ttk.Label(g, text=label).grid(row=i, column=0, sticky="w")
+            cb = ttk.Combobox(g, width=58)
+            cb.grid(row=i, column=1, sticky="we", padx=4, pady=1)
+            self.gian_std_cb[f] = cb
+        n = len(self.gian_std_cb)
+        ttk.Label(g, text="지정날짜").grid(row=n, column=0, sticky="w")
+        self.gian_std_mmdd = tk.StringVar()
+        dd = ttk.Frame(g)
+        dd.grid(row=n, column=1, sticky="w", padx=4)
+        ttk.Entry(dd, textvariable=self.gian_std_mmdd, width=7).pack(side="left")
+        ttk.Label(dd, text="(월-일, 예: 03-02 → 다가오는 그 날짜로 설정)", foreground="#777").pack(side="left", padx=4)
+        ttk.Label(g, text="필수 첨부").grid(row=n + 1, column=0, sticky="w")
+        self.gian_std_req = tk.StringVar()
+        ttk.Entry(g, textvariable=self.gian_std_req).grid(row=n + 1, column=1, sticky="we", padx=4, pady=1)
+        ttk.Label(g, text="선택 첨부").grid(row=n + 2, column=0, sticky="w")
+        self.gian_std_opt = tk.StringVar()
+        ttk.Entry(g, textvariable=self.gian_std_opt).grid(row=n + 2, column=1, sticky="we", padx=4, pady=1)
+        g.columnconfigure(1, weight=1)
+        ttk.Button(frm, text="이 값으로 표준 확정", command=self.gian_std_confirm).pack(anchor="e", pady=(4, 0))
+        self._gian_std_render()
+
+    def _gian_std_render(self):
+        self.gian_stree.delete(*self.gian_stree.get_children())
+        items = sorted(self.gian_stds.items(), key=lambda kv: (-kv[1].get("count", 0), kv[1].get("name", "")))
+        self._gian_std_keys = [k for k, _s in items]
+        for i, (k, s) in enumerate(items):
+            sp = s.get("spread", 0)
+            tag = ("done",) if s.get("confirmed") else ("warn",) if sp else ()
+            self.gian_stree.insert("", "end", iid=str(i), tags=tag, values=(
+                s.get("name", ""), s.get("count", 0), "확정" if s.get("confirmed") else "제안", sp or ""))
+
+    def _gian_std_sel(self):
+        sel = self.gian_stree.selection()
+        return self._gian_std_keys[int(sel[0])] if sel else None
+
+    def _gian_std_pick(self, _e=None):
+        k = self._gian_std_sel()
+        if not k:
+            return
+        s = self.gian_stds[k]
+        lines = ["[{}] 표준 {} — 문서 {}건".format(s["name"], "확정" if s.get("confirmed") else "제안", s.get("count", 0))]
+        for f, label in gian_draft.FIELDS:
+            fv = s["fields"].get(f, {})
+            vals = [v for v, _d in fv.get("variants", [])]
+            if fv.get("value") and fv["value"] not in vals:
+                vals.insert(0, fv["value"])
+            self.gian_std_cb[f]["values"] = vals
+            self.gian_std_cb[f].set(fv.get("value", ""))
+            if len(fv.get("variants", [])) > 1:
+                lines.append("⚠ {}: ".format(label) + "  /  ".join(
+                    "{} [{}]".format(v, ",".join(d)) for v, d in fv["variants"]))
+        for sp in s.get("att_spellings", []):
+            lines.append("⚠ 첨부 이름 표기가 섞임: " + "  /  ".join(sp))
+        self.gian_std_mmdd.set(s.get("read_mmdd", ""))
+        self.gian_std_req.set(" | ".join(s.get("atts_required", [])))
+        self.gian_std_opt.set(" | ".join(s.get("atts_optional", [])))
+        if len(lines) == 1:
+            lines.append("✓ 결재선·과제카드·공개·열람제한·수신·첨부는 지금까지 올린 문서가 모두 같습니다.")
+        lines.append("")
+        lines.extend(gian_draft.body_template_lines(s))
+        self.gian_box.delete("1.0", "end")
+        self.gian_box.insert("1.0", "\n".join(lines))
+
+    def gian_std_build(self):
+        if not (HAS_WS and HAS_GIAN):
+            messagebox.showerror("오류", "websocket-client와 comtypes가 필요합니다.")
+            return
+        self.gian_status.set("과거 기안의 결재선·과제카드·공개여부 읽는 중… (읽기만)")
+
+        def prog(i, n):
+            self.ui_post("gian_prog", "과거 기안 본문 읽는 중… {}/{} (읽기만)".format(i, n))
+
+        def work():
+            try:
+                rows, st = gian_draft.read_doc_meta(self._port(), find_target_page, CDP,
+                                                    with_body=True, progress=prog)
+            except Exception as e:
+                rows, st = None, str(e)
+            self.ui_post("gian_std", {"rows": rows, "status": st})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_std(self, p):
+        if not p["rows"]:
+            self.gian_status.set("⚠ " + p["status"])
+            return
+        prop = gian_draft.propose_standards(p["rows"])
+        self.gian_stds = gian_draft.merge_standards(self.gian_stds, prop)
+        try:
+            gian_draft.save_standards(self.GIAN_STD_PATH, self.gian_stds)
+        except Exception as e:
+            self.log("기안 표준 저장 실패: {}".format(e))
+        self._gian_std_render()
+        n_sp = sum(1 for s in self.gian_stds.values() if s.get("spread") and not s.get("confirmed"))
+        self.gian_status.set("표준 {}종 ({}) — 들쭉날쭉한 종류 {}개. 종류를 골라 값 확인 후 '확정'".format(
+            len(self.gian_stds), p["status"], n_sp))
+        self.log("[{}] 기안 표준: {}종 갱신".format(datetime.now().strftime("%H:%M:%S"), len(self.gian_stds)))
+
+    def gian_std_confirm(self):
+        k = self._gian_std_sel()
+        if not k:
+            messagebox.showinfo("기안 표준", "확정할 기안 종류를 먼저 고르세요.")
+            return
+        s = self.gian_stds[k]
+        for f, _l in gian_draft.FIELDS:
+            s["fields"].setdefault(f, {})["value"] = self.gian_std_cb[f].get().strip()
+        mmdd = self.gian_std_mmdd.get().strip()
+        if mmdd and not re.match(r"^\d{2}-\d{2}$", mmdd):
+            messagebox.showwarning("기안 표준", "지정날짜는 '03-02'처럼 월-일로 적어 주세요.")
+            return
+        s["read_mmdd"] = mmdd
+        split = lambda t: [x.strip() for x in t.split("|") if x.strip()]
+        s["atts_required"], s["atts_optional"] = split(self.gian_std_req.get()), split(self.gian_std_opt.get())
+        s["confirmed"] = True
+        s["confirmed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        gian_draft.save_standards(self.GIAN_STD_PATH, self.gian_stds)
+        self._gian_std_render()
+        self.gian_status.set("'{}' 표준 확정 — 재작성 창을 열면 자동으로 대조합니다".format(s["name"]))
+
+    def gian_std_check(self, quiet=False, append=False):
+        if not self.gian_win:
+            if not quiet:
+                messagebox.showinfo("기안 표준", "먼저 ② 재작성 창 열기(또는 열린 기안 창 읽기)를 하세요.")
+            return
+        ie, top = self.gian_win
+        stds = self.gian_stds
+
+        def work():
+            try:
+                res = gian_draft.check_open_window(ie, top, stds)
+            except Exception as e:
+                res = {"ok": False, "err": str(e)}
+            res["quiet"], res["append"] = quiet, append
+            self.ui_post("gian_check", res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def gian_std_fix(self):
+        if not self.gian_win:
+            messagebox.showinfo("기안 표준", "먼저 ② 재작성 창 열기(또는 열린 기안 창 읽기)를 하세요.")
+            return
+        ie, top = self.gian_win
+
+        def work():
+            try:
+                wm = gian_draft.read_window_meta(gian_draft.Gianki(ie, top))
+                std = self.gian_stds.get(gian_draft.group_key(wm["title"]))
+                if not std:
+                    res = {"ok": False, "err": "이 기안 종류의 표준이 없습니다"}
+                else:
+                    res = gian_draft.fix_window(ie, top, std)
+                    res.update(name=std["name"], confirmed=std.get("confirmed"), fixed=True)
+            except Exception as e:
+                res = {"ok": False, "err": str(e)}
+            self.ui_post("gian_check", res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_check(self, r):
+        if not r.get("ok"):
+            if not r.get("quiet"):
+                self.gian_status.set("⚠ 표준 점검: " + str(r.get("err")))
+            return
+        bad = [x for x in r["findings"] if not x["ok"]]
+        if r.get("quiet") and not bad and not r.get("append"):
+            self.gian_status.set(self.gian_status.get() + "  ·  표준 점검 ✓")
+            return
+        info = [x for x in r["findings"] if x["ok"] and x["tip"]]
+        head = "[{}] 표준 {} — {}: {}".format(
+            r["at"], "맞추기 후 점검" if r.get("fixed") else "점검", r["name"],
+            "모두 표준과 같음 ✓" if not bad else "다른 곳 {}개".format(len(bad)))
+        lines = [head + ("" if r.get("confirmed") else "  (아직 '제안' 표준 — 확정 전)"), ""]
+        for x in r["findings"]:
+            if x["ok"] and not x["tip"]:
+                lines.append("  ✓ {}: {}".format(x["field"], x["have"] if x["field"] != "첨부" else x["want"]))
+        for x in bad:
+            lines.append("  ⚠ {}: 지금 '{}' → 표준 '{}'{}{}".format(
+                x["field"], x["have"], x["want"], "  [맞추기 가능]" if x["fix"] else "",
+                ("  — " + x["tip"]) if x["tip"] else ""))
+        for x in info:
+            lines.append("  · {}: {} — {}".format(x["field"], x["have"], x["tip"]))
+        fixable = any(x["fix"] for x in bad)
+        summary = "표준 점검: " + ("✓ 이상 없음" if not bad else "⚠ {}곳 다름{}".format(
+            len(bad), " — [공개·열람제한 맞추기] 가능" if fixable else ""))
+        if r.get("append"):                      # 초안 적용 보고 아래에 덧붙임
+            self.gian_box.insert("end", "\n\n" + "\n".join(lines))
+            self.gian_status.set(self.gian_status.get() + "  ·  " + summary)
+            return
+        self.gian_box.delete("1.0", "end")
+        self.gian_box.insert("1.0", "\n".join(lines))
+        self.gian_status.set(summary)
+        if bad and not r.get("fixed") and not r.get("quiet"):
+            self.gian_nb.select(2)
+
+    def gian_load(self):
+        if not (HAS_WS and HAS_GIAN):
+            messagebox.showerror("오류", "websocket-client와 comtypes가 필요합니다.")
+            return
+        self.gian_status.set("기안한문서 읽는 중…")
+
+        def work():
+            try:
+                rows, st = gian_draft.read_drafted_list(self._port(), find_target_page, CDP)
+            except Exception as e:
+                rows, st = None, str(e)
+            self.ui_post("gian_list", {"rows": rows, "status": st})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_list(self, p):
+        self.gian_status.set(p["status"])
+        if not p["rows"]:
+            return
+        self.gian_groups = gian_draft.group_rows(p["rows"])
+        self.gian_gtree.delete(*self.gian_gtree.get_children())
+        for i, g in enumerate(self.gian_groups):
+            self.gian_gtree.insert("", "end", iid=str(i), values=(g["count"], g["sample"]))
+        if self.gian_groups:
+            self.gian_gtree.selection_set("0")
+
+    def _gian_pick_group(self, _e=None):
+        sel = self.gian_gtree.selection()
+        if not sel:
+            return
+        g = self.gian_groups[int(sel[0])]
+        vals = ["{}  {}  ({})".format(r["docno"], r["title"], r["done"][:10]) for r in g["rows"]]
+        self.gian_src_cb["values"] = vals
+        self.gian_src.set(vals[0] if vals else "")
+
+    def gian_open(self, docno=None):
+        if not (HAS_WS and HAS_GIAN):
+            messagebox.showerror("오류", "websocket-client와 comtypes가 필요합니다.")
+            return
+        if docno is None:                              # [② 재작성 창 열기] 버튼: 왼쪽에서 고른 원본
+            self._gian_case_ctx = None
+            src = self.gian_src.get().strip()
+            if not src:
+                messagebox.showinfo("기안 도우미", "왼쪽에서 원본으로 쓸 기안을 먼저 고르세요.")
+                return
+            docno = src.split()[0]
+        self.gian_status.set("{} 재작성 창 여는 중… (기안기가 뜰 때까지 10~30초)".format(docno))
+
+        def work():
+            try:
+                before = {ie for _t, ie, _x in gian_draft.find_wxs_windows()}
+                st = gian_draft.open_redraft(self._port(), docno, find_target_page, CDP)
+                if st != "ok":
+                    msg = {"noframe": "에듀파인 [기안한문서] 화면이 열려 있지 않습니다",
+                           "notfound": "목록에서 {}를 찾지 못했습니다(다른 쪽에 있을 수 있음)".format(docno)}.get(st, st)
+                    self.ui_post("gian_read", {"err": msg})
+                    return
+                win, notes = gian_draft.wait_new_gianki(before)
+                for n in notes:
+                    self.ui_post("log", "[{}] 기안 도우미: {}".format(datetime.now().strftime("%H:%M:%S"), n))
+                if not win:
+                    tip = next((n for n in notes if n.startswith("⚠")), "기안기 창이 뜨지 않았습니다 (WXSClient 확인)")
+                    self.ui_post("gian_read", {"err": tip})
+                    return
+                data = gian_draft.read_gianki(*win)
+                data["win"] = win
+                self.ui_post("gian_read", data)
+            except Exception as e:
+                self.ui_post("gian_read", {"err": str(e)})
+        threading.Thread(target=work, daemon=True).start()
+
+    def gian_read_open(self):
+        if not HAS_GIAN:
+            messagebox.showerror("오류", "comtypes가 필요합니다 (pip install comtypes).")
+            return
+
+        def work():
+            try:
+                wins = gian_draft.find_wxs_windows()
+                if not wins:
+                    self.ui_post("gian_read", {"err": "열린 재작성 기안 창이 없습니다"})
+                    return
+                top, ie, _t = wins[-1]
+                data = gian_draft.read_gianki(ie, top)
+                data["win"] = (ie, top)
+                self.ui_post("gian_read", data)
+            except Exception as e:
+                self.ui_post("gian_read", {"err": str(e)})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_read(self, p):
+        ctx, self._gian_case_ctx = self._gian_case_ctx, None      # 사안 카드에서 연 창이면 값 미리 채움
+        if p.get("err"):
+            self.gian_status.set("⚠ " + p["err"])
+            return
+        self.gian_win = p["win"]
+        self._gian_case_active = ctx["case"] if ctx else None
+        self.gian_vars = [{"label": v["label"], "old": v["old"], "new": v["old"], "orig": v["old"]}
+                          for v in p["vars"]]
+        self._gian_orig_title = p["title"]
+        self._gian_title_touched = False
+        self._gian_render_vars()
+        self.gian_status.set("기안 창 연결됨 — 바뀌는 값만 고치고 ③을 누르세요")
+        self.gian_box.delete("1.0", "end")
+        head = self._gian_case_prefill(ctx, p["text"]) if ctx else []
+        self.gian_box.insert("1.0", ("\n".join(head) + "\n\n" if head else "") +
+                             gian_draft.body_region(p["text"]).strip())
+        if ctx:
+            self.gian_nb.select(0)
+            self.gian_status.set("{} '{}' 초안 창 — 노란 줄(미리 채운 값) 확인 후 ③ 초안에 적용".format(
+                ctx["case"], ctx["name"]))
+        self.log("[{}] 기안 도우미: '{}' 재작성 창 연결, 바뀔 후보 {}개".format(
+            datetime.now().strftime("%H:%M:%S"), p["title"], len(self.gian_vars)))
+        self._gian_att_load(p.get("atts", []), p.get("butim", []))
+        if self.gian_stds:
+            self.root.after(300, lambda: self.gian_std_check(quiet=True))   # 표준이 있으면 자동 대조
+
+    def _gian_preview_title(self):
+        """원본 제목에 표의 치환을 적용한 제목 (gian_draft.apply_changes와 같은 규칙)."""
+        t = self._gian_orig_title
+        pairs = sorted([(v["old"], v["new"]) for v in self.gian_vars if v["old"] != v["new"]],
+                       key=lambda p: -len(p[0]))
+        for i, (o, _n) in enumerate(pairs):
+            t = t.replace(o, "@@T{}@@".format(i))
+        for i, (_o, n) in enumerate(pairs):
+            t = t.replace("@@T{}@@".format(i), n)
+        return t
+
+    def _gian_render_vars(self):
+        keep = self.gian_vtree.selection()
+        self.gian_vtree.delete(*self.gian_vtree.get_children())
+        for i, v in enumerate(self.gian_vars):
+            self.gian_vtree.insert("", "end", iid=str(i), values=(v["label"], v["old"], v["new"]),
+                                   tags=("chg",) if v["new"] != v["old"] else ())
+        if keep and keep[0] in self.gian_vtree.get_children():
+            self.gian_vtree.selection_set(keep[0])
+        # 새 제목: 사람이 직접 고치지 않았으면 치환 결과로 자동 갱신
+        if not getattr(self, "_gian_title_touched", False) or self.gian_title.get() == getattr(self, "_gian_auto_title", None):
+            self._gian_auto_title = self._gian_preview_title()
+            self.gian_title.set(self._gian_auto_title)
+            self._gian_title_touched = False
+
+    def _gian_pick_var(self, _e=None):
+        sel = self.gian_vtree.selection()
+        if sel:
+            self.gian_new.set(self.gian_vars[int(sel[0])]["new"])
+
+    def _gian_set_new(self):
+        sel = self.gian_vtree.selection()
+        if not sel:
+            return
+        i = int(sel[0])
+        self.gian_vars[i]["new"] = self.gian_new.get()
+        if self.gian_title.get() != getattr(self, "_gian_auto_title", None):
+            self._gian_title_touched = True
+        self._gian_render_vars()
+        nxt = str(i + 1)
+        if nxt in self.gian_vtree.get_children():
+            self.gian_vtree.selection_set(nxt)
+            self.gian_vtree.see(nxt)
+
+    def _gian_add_pair(self):
+        old = simpledialog.askstring("행 추가", "기안문에서 바꿀 원본 글자 (본문에 있는 그대로):", parent=self.root)
+        if not old:
+            return
+        new = simpledialog.askstring("행 추가", "'{}' 를 무엇으로 바꿀까요?".format(old), parent=self.root) or old
+        self.gian_vars.append({"label": "직접", "old": old, "new": new, "orig": old})
+        self._gian_render_vars()
+
+    def _gian_del_pair(self):
+        sel = self.gian_vtree.selection()
+        if sel:
+            del self.gian_vars[int(sel[0])]
+            self._gian_render_vars()
+
+    def gian_apply(self):
+        if not self.gian_win:
+            messagebox.showinfo("기안 도우미", "먼저 ② 재작성 창 열기(또는 열린 기안 창 읽기)를 하세요.")
+            return
+        pairs = [(v["old"], v["new"]) for v in self.gian_vars if v["new"] != v["old"]]
+        title = self.gian_title.get().strip()
+        if not pairs and title == self._gian_orig_title:
+            messagebox.showinfo("기안 도우미", "바뀐 값이 없습니다. 오른쪽 표에서 새 값을 고친 뒤 적용하세요.")
+            return
+        empty = [o for o, n in pairs if not n.strip()]
+        if empty and not messagebox.askyesno("확인", "빈 값으로 바꾸는 항목이 있습니다:\n{}\n그대로 진행할까요?".format("\n".join(empty))):
+            return
+        self.gian_status.set("기안 창에 적용 중…")
+        ie, top = self.gian_win
+
+        def work():
+            try:
+                res = gian_draft.apply_changes(ie, top, pairs, title or None)
+            except Exception as e:
+                res = {"ok": False, "err": str(e)}
+            self.ui_post("gian_apply", res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_gian_apply(self, r):
+        if not r.get("ok"):
+            self.gian_status.set("⚠ 적용 실패: {} (기안 창이 닫혔으면 ②부터 다시)".format(r.get("err")))
+            return
+        if self._gian_case_active:                # 사안 카드에서 만든 초안: 고친 값(접수 일시 등)을 카드에 기억
+            cv = self.gian_cases_saved.setdefault(self._gian_case_active, {"vars": {}}).setdefault("vars", {})
+            for v in self.gian_vars:
+                if v["new"] != v["old"] and v["new"].strip() and v["label"] not in gian_draft.CASE_LEARN_SKIP:
+                    cv[v["label"]] = v["new"]
+            self._gian_case_save()
+        # 적용이 끝났으니 지금 상태를 새 원본으로 (같은 창에 또 고칠 때 이중 치환 방지)
+        for v in self.gian_vars:
+            v["old"] = v["new"]
+        self._gian_orig_title = r["title"]
+        self._gian_title_touched = False
+        self._gian_render_vars()
+        lines = ["[{}] 초안 적용 완료 — 제목: {}".format(r["at"], r["title"]), ""]
+        for x in r["report"]:
+            ok = x["now"] > 0 and not x["left"]
+            lines.append("{} '{}' → '{}'   (원본 {}곳 → 지금 새 값 {}곳{})".format(
+                "✓" if ok else "⚠", x["old"], x["new"], x["found"], x["now"],
+                "" if not x["left"] else ", 원본 {}곳 남음".format(x["left"])))
+        for w in r["warn"]:
+            lines.append("⚠ " + (w if len(w) > 8 else "짧은 글자 '{}' 는 다른 곳까지 바뀌었을 수 있음".format(w)))
+        lines.append("")
+        lines.append("다음: [붙임 파일] 장에서 옛 사안 첨부를 새 파일로 바꿔 끼우기(④). 관련 학생 표·결재경로는 "
+                     "기안 창에서 확인하고 [결재올림]은 직접 누르세요.")
+        self.gian_box.delete("1.0", "end")
+        self.gian_box.insert("1.0", "\n".join(lines))
+        self.gian_status.set("적용 완료 — 기안 창을 앞으로 띄웠습니다. 확인 후 직접 결재올림")
+        if self.gian_stds:                        # 바꾼 뒤 본문·사안번호·붙임을 표준과 다시 대조
+            self.root.after(200, lambda: self.gian_std_check(quiet=True, append=True))
+        self.log("[{}] 기안 도우미: 초안 적용 ({}건 치환) — {}".format(r["at"], len(r["report"]), r["title"]))
 
     # ===================== 마감 D-Day =====================
     def _build_dday(self):
@@ -3793,9 +4787,8 @@ class ConsoleApp:
                 b.configure(bg=pale, fg="#333")
                 f.pack_forget()
 
-    def _build_dashboard(self):
-        """세션 유지 + 결재 관제를 한 탭에 (컴팩트 표)."""
-        frm = self.tab_dash
+    def _build_dashboard(self, frm):
+        """세션 유지 + 결재 관제 (컴팩트 표) — '오늘' 탭 아래쪽에 붙는다."""
 
         # ===== 세션 유지 =====
         lf_s = ttk.LabelFrame(frm, text="세션 유지 (자동 로그아웃 방지)", padding=8)
@@ -3837,10 +4830,9 @@ class ConsoleApp:
             self.mon_tree.column(c, width=w, anchor="w")
         self.mon_tree.pack(fill="x", pady=(6, 0))
 
-        ttk.Label(frm, foreground="#888", justify="left", wraplength=1000, text=(
-            "① 로그인 자동화 실행(디버그 크롬 뜨고 로그인) → ② 세션 유지 시작 / 관제 시작.  "
-            "각 사이트 탭이 디버그 크롬에 열려 로그인돼 있어야 숫자가 잡힙니다.")
-        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(frm, foreground="#888", text=(
+            "· ① 로그인 자동화 실행(디버그 크롬 뜨고 로그인) → 세션 유지 시작 / 관제 시작.")
+        ).pack(anchor="w")
 
     def _build_query(self):
         frm = self.tab_query
@@ -4493,7 +5485,7 @@ class ConsoleApp:
             self.call_sel.add(key)
         self._call_refresh_sel()
 
-    CALL_MARK = {"on": "●", "old": "◐", "off": "○"}
+    CALL_MARK = {"on": "●", "old": "◐", "off": "○", "unk": "?"}
 
     def _call_refresh_sel(self):
         online = getattr(self, "call_online", {})
@@ -4507,7 +5499,9 @@ class ConsoleApp:
             elif st == "old":
                 b.config(bg="#fff4cc", fg="#8a6d00")          # ◐ 핑엔 무응답이지만 오늘 수신 기록 있음(구버전 추정)
             elif st == "off":
-                b.config(bg="#ececec", fg="#a0a0a0")          # ○ 응답 없음
+                b.config(bg="#ececec", fg="#a0a0a0")          # ○ 응답 없음(v1.4+ 앱인데 무응답 = 꺼짐/끊김)
+            elif st == "unk":
+                b.config(bg="#f6f6f6", fg="#7a7a7a")          # ? 확인 불가(핑을 못 듣는 구버전·미설치)
             else:
                 b.config(bg="SystemButtonFace", fg="black")   # 아직 확인 안 함
         if self.call_sel:
@@ -4658,7 +5652,10 @@ class ConsoleApp:
         self._note_seen(b)
         if b.get("t") == "pong":
             self._mark_board(b.get("pid"), b.get("cls"), "인터넷", b.get("ver"), b.get("ip"), b.get("port"),
-                             b.get("mac"))
+                             b.get("mac"), info=b)
+            return
+        if b.get("t") == "hello":
+            self._on_board_hello(b)
             return
         cid, cls = b.get("cid"), (b.get("cls") or "").strip()
         kind = b.get("t", "ack")
@@ -4689,6 +5686,71 @@ class ConsoleApp:
             except Exception:
                 pass
 
+    HELLO_LIVE_SEC = 15 * 60   # 이 시간 안에 온 '켜짐 알림'만 지금 켜져 있는 것으로 표시
+
+    def _on_board_hello(self, b):
+        """칠판 앱(v1.6+)이 켜져 인터넷에 붙었을 때 스스로 보내는 알림. [연결 확인] 없이도 ●로 바뀐다."""
+        cls = (b.get("cls") or "").strip()
+        if not cls:
+            return
+        self._save_board_info(cls, b)
+        at = float(b.get("_time") or time.time())
+        if time.time() - at > self.HELLO_LIVE_SEC:
+            return                                   # 콘솔을 켤 때 받아온 지난 기록 — 저장만 하고 표시는 안 함
+        online = getattr(self, "call_online", None)
+        if online is None:
+            online = self.call_online = {}
+        online[cls] = {"state": "on", "via": {"켜짐 알림"}, "ver": b.get("ver"), "at": at}
+        self._call_refresh_sel()
+        why = {"boot": "칠판 켜짐", "start": "앱 시작", "reconnect": "다시 연결"}.get(b.get("reason"), "연결")
+        if b.get("down_sec"):
+            why += "(끊겼던 시간 {}분)".format(int(b.get("down_sec")) // 60)
+        net = {"eth": "유선", "wifi": "와이파이"}.get(b.get("net"), b.get("net") or "?")
+        self.log("[{}] ● {} 칠판 {} — {} {}".format(datetime.fromtimestamp(at).strftime("%H:%M"),
+                                                    self._class_label(cls), why, net, b.get("ip", "")))
+
+    def _save_board_info(self, cls, info, arp_mac_val=None):
+        """칠판이 알려준 주소·MAC을 직접 전송/전원 켜기용으로 저장.
+           mac = 유선(전원 켜기는 유선 MAC으로만 됨), mac_wifi = 무선, mac_arp = 이 PC가 그 IP에서 본 MAC.
+           (예전엔 arp 값이 앱이 알려준 유선 MAC을 덮어써서 무선 MAC이 들어간 반이 있었다)"""
+        boards = self.cfg.setdefault("classroom_call", {}).setdefault("boards", {})
+        cur = dict(boards.get(cls) or {})
+        new = dict(cur)
+        ip = info.get("ip")
+        if ip and ip != "주소없음":
+            new["ip"] = ip
+            new["port"] = info.get("port") or cur.get("port", 8787)
+        new.setdefault("room", "")
+        eth = norm_mac(info.get("mac_eth"))
+        if not eth and info.get("mac") and not self._is_v16(info.get("ver")):
+            eth = norm_mac(info.get("mac"))          # v1.5는 유선 우선으로 보냈음
+        if eth:
+            new["mac"] = eth
+        wifi = norm_mac(info.get("mac_wifi"))
+        if wifi:
+            new["mac_wifi"] = wifi
+        if arp_mac_val:
+            new["mac_arp"] = norm_mac(arp_mac_val)
+        for k in ("net", "eth_link", "ver"):
+            if info.get(k) not in (None, ""):
+                new[k] = info.get(k)
+        if new != cur:
+            boards[cls] = new
+            try:
+                save_config(self.cfg)
+            except Exception:
+                pass
+            return True
+        return False
+
+    @staticmethod
+    def _is_v16(ver):
+        try:
+            major, minor = (str(ver or "0.0").split(".") + ["0"])[:2]
+            return (int(major), int(minor)) >= (1, 6)
+        except Exception:
+            return False
+
     # ---- 연결 확인: 메시지를 띄우지 않고 각 반 칠판이 지금 받을 수 있는 상태인지 확인 ----
     CALL_PING_SEC = 10     # 이 시간 안에 응답이 없으면 '응답 없음'
 
@@ -4715,18 +5777,18 @@ class ConsoleApp:
             def probe(cls, b):
                 info = probe_lan(b.get("ip"), b.get("port", port))
                 if info and (info.get("class") or cls):
-                    self.ui_post("call_presence", {"pid": pid, "cls": info.get("class") or cls, "via": "학교망",
-                                                   "ver": info.get("ver"), "ip": b.get("ip"), "port": b.get("port", port),
-                                                   "mac": arp_mac(b.get("ip"))})
+                    self.ui_post("call_presence", dict(info, pid=pid, cls=info.get("class") or cls, via="학교망",
+                                                       ip=b.get("ip"), port=b.get("port", port),
+                                                       mac_arp=arp_mac(b.get("ip"))))
             ts = [threading.Thread(target=probe, args=(k, v), daemon=True) for k, v in boards.items()]
             for t in ts:
                 t.start()
             # 학교망: 브로드캐스트로 새로 켜진 칠판도 찾기
             for info in discover_boards(port=port, wait=2.5):
                 if info.get("class"):
-                    self.ui_post("call_presence", {"pid": pid, "cls": info.get("class"), "via": "학교망",
-                                                   "ver": info.get("ver"), "ip": info.get("ip"),
-                                                   "port": info.get("port", port), "mac": arp_mac(info.get("ip"))})
+                    self.ui_post("call_presence", dict(info, pid=pid, cls=info.get("class"), via="학교망",
+                                                       port=info.get("port", port),
+                                                       mac_arp=arp_mac(info.get("ip"))))
         threading.Thread(target=work, daemon=True).start()
         self.root.after(self.CALL_PING_SEC * 1000, lambda p=pid: self._finish_board_check(p))
 
@@ -4781,7 +5843,7 @@ class ConsoleApp:
             if not sent:
                 self.call_status.set("⚡ MAC 주소가 없어 신호를 보내지 못했습니다")
 
-    def _mark_board(self, pid, cls, via, ver=None, ip=None, port=None, mac=None):
+    def _mark_board(self, pid, cls, via, ver=None, ip=None, port=None, mac=None, info=None):
         ping = getattr(self, "call_ping", None)
         cls = (cls or "").strip()
         if not ping or pid != ping["pid"] or not cls:
@@ -4790,14 +5852,11 @@ class ConsoleApp:
         rec["state"] = "on"
         rec["via"].add(via)
         rec["ver"] = ver or rec.get("ver")
-        # 응답에 실린 칠판 주소로 학교망 직접 전송용 등록을 최신화
-        if ip and ip != "주소없음":
-            boards = self.cfg.setdefault("classroom_call", {}).setdefault("boards", {})
-            cur = boards.get(cls) or {}
-            mac = norm_mac(mac) or cur.get("mac", "")
-            if cur.get("ip") != ip or cur.get("mac", "") != mac:
-                boards[cls] = dict(cur, ip=ip, port=port or cur.get("port", 8787), room=cur.get("room", ""), mac=mac)
-                ping["ip_changed"] = True
+        # 응답에 실린 칠판 주소·MAC으로 학교망 직접 전송/전원 켜기용 등록을 최신화
+        info = dict(info or {}, ip=ip, port=port, ver=ver)
+        if mac and not info.get("mac"):
+            info["mac"] = mac
+        self._save_board_info(cls, info, arp_mac_val=info.get("mac_arp"))
         self._call_refresh_sel()
         n = sum(1 for r in self.call_online.values() if r["state"] == "on")
         if not ping["done"]:
@@ -4823,8 +5882,12 @@ class ConsoleApp:
                 if recent and not self._is_v14(last.get("ver")):
                     # 핑엔 무응답이지만 최근에 실제 호출을 받았던 반 = 핑을 못 듣는 구버전 앱일 가능성이 큼
                     self.call_online[key] = {"state": "old", "via": set(), "at": last.get("at")}
+                elif self._is_v14(last.get("ver")):
+                    # 핑을 듣는 앱이 깔린 걸 아는 반인데 무응답 = 정말로 꺼짐/네트워크 끊김
+                    self.call_online[key] = {"state": "off", "via": set(), "at": last.get("at")}
                 else:
-                    self.call_online[key] = {"state": "off", "via": set(), "at": last.get("at") if recent else None}
+                    # 구버전이거나 앱 기록이 전혀 없는 반 = 켜져 있어도 핑엔 답할 수 없음 → 판단 불가
+                    self.call_online[key] = {"state": "unk", "via": set(), "at": last.get("at") if recent else None}
         if ping.get("ip_changed"):
             try:
                 save_config(self.cfg)
@@ -4859,10 +5922,10 @@ class ConsoleApp:
     def _board_check_summary(self, log=False):
         order = lambda k: (int(k.split("-")[0]), int(k.split("-")[1]))
         pick = lambda st: sorted([k for k, r in self.call_online.items() if r["state"] == st], key=order)
-        on, old, off = pick("on"), pick("old"), pick("off")
+        on, old, off, unk = pick("on"), pick("old"), pick("off"), pick("unk")
         now = datetime.now().strftime("%H:%M")
-        self.call_status.set("📡 {} 확인 — ● 연결됨 {} · ◐ 구버전 추정 {} · ○ 응답 없음 {}".format(
-            now, len(on), len(old), len(off)))
+        self.call_status.set("📡 {} 확인 — ● 연결됨 {} · ◐ 구버전 추정 {} · ○ 꺼짐/끊김 {} · ? 확인 불가 {}".format(
+            now, len(on), len(old), len(off), len(unk)))
         if not log:
             return
         lab = lambda ks: ", ".join(self._class_label(k) for k in ks)
@@ -4870,12 +5933,15 @@ class ConsoleApp:
         self.log("[{}] 연결 확인 — ● 연결됨({}): {}".format(now, len(on), lab(on) or "없음"))
         if old:
             self.log("   ◐ 구버전 추정({}): {} — 핑엔 무응답이지만 최근 실제 호출을 받았던 반입니다. "
-                     "앱을 v1.4로 올리면 ●로 확인됩니다.".format(
+                     "앱을 v1.6으로 올리면 ●로 확인됩니다.".format(
                          len(old), ", ".join("{}({} 수신)".format(self._class_label(k), hm(self.call_online[k].get("at")))
                                               for k in old)))
         if off:
-            self.log("   ○ 응답 없음({}): {} — 칠판 꺼짐·앱 꺼짐·인터넷 끊김이거나, 최근 12시간 수신 기록이 없는 반입니다.".format(
+            self.log("   ○ 꺼짐/끊김({}): {} — 새 앱이 깔린 칠판인데 응답 없음: 칠판 전원 꺼짐 또는 와이파이 끊김.".format(
                 len(off), lab(off)))
+        if unk:
+            self.log("   ? 확인 불가({}): {} — 구버전 앱(v1.3 이하)이거나 앱이 없어 켜져 있어도 대답을 못 하는 반. "
+                     "v1.6을 깔면 확인됩니다.".format(len(unk), lab(unk)))
 
     def _start_call_listener(self):
         base = self.cfg.get("classroom_call", {}).get("topic", "")
@@ -5130,9 +6196,8 @@ class ConsoleApp:
                     self._on_call_reply(payload)
                 elif kind == "call_presence":
                     self._mark_board(payload.get("pid"), payload.get("cls"), payload.get("via"),
-                                     payload.get("ver"), payload.get("ip"), payload.get("port"), payload.get("mac"))
-                elif kind == "approval":
-                    self._show_approval(payload)
+                                     payload.get("ver"), payload.get("ip"), payload.get("port"), payload.get("mac"),
+                                     info=payload)
                 elif kind == "alim":
                     self._show_alim(payload)
                 elif kind == "meal":
@@ -5141,6 +6206,22 @@ class ConsoleApp:
                     self._record_stat(payload)
                 elif kind == "conn":
                     self.conn_var.set(payload)
+                elif kind == "gian_list":
+                    self._show_gian_list(payload)
+                elif kind == "gian_read":
+                    self._show_gian_read(payload)
+                elif kind == "gian_apply":
+                    self._show_gian_apply(payload)
+                elif kind == "gian_att":
+                    self._show_gian_att(payload)
+                elif kind == "gian_std":
+                    self._show_gian_std(payload)
+                elif kind == "gian_check":
+                    self._show_gian_check(payload)
+                elif kind == "gian_prog":
+                    self.gian_status.set(payload)
+                elif kind == "gian_case":
+                    self._show_gian_case(payload)
         except queue.Empty:
             pass
         # 다음 갱신까지 남은 시간 표시
