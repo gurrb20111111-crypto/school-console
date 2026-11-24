@@ -477,32 +477,6 @@ DOCLIST_JS = FRAME_WALK + r"""
 })();
 """
 
-# ── 출결 미마감 점검: '학급'과 '마감/미마감' 상태가 같이 든 행을 찾음 (패턴 설정 가능) ──
-ATTENDANCE_JS_TMPL = FRAME_WALK + r"""
-(function(){
-  var re=new RegExp(%CLASS_RE%);
-  var unclosed=%UNCLOSED%, closed=%CLOSED%;
-  var docs=__collectDocs(); var out=[]; var seen={};
-  for (var d=0; d<docs.length; d++){
-    var rows=docs[d].querySelectorAll('tr,[class*="row"],[role="row"],li');
-    for (var i=0;i<rows.length;i++){
-      var t=(rows[i].innerText||rows[i].textContent||'').replace(/\s+/g,' ').trim();
-      if (!t || t.length>140) continue;
-      var m=t.match(re); if (!m) continue;
-      var cls=m[0].replace(/\s+/g,'');
-      var status='';
-      for (var u=0;u<unclosed.length;u++){ if (t.indexOf(unclosed[u])!==-1){ status='미마감'; break; } }
-      if (!status){ for (var c=0;c<closed.length;c++){ if (t.indexOf(closed[c])!==-1){ status='마감'; break; } } }
-      if (!status) continue;
-      var key=cls+'|'+status; if (seen[key]) continue; seen[key]=1;
-      out.push({ cls:cls, status:status });
-    }
-  }
-  return JSON.stringify(out);
-})();
-"""
-
-
 def list_pages(port):
     url = "http://127.0.0.1:{}/json/list".format(port)
     with urllib.request.urlopen(url, timeout=4) as r:
@@ -1295,6 +1269,51 @@ NEIS_HELPER_JS = r"""
 
   window.__sc = {
     hasGrid: function(){ return header() ? '1' : '0'; },
+    // 날짜는 키보드로 넣지 않고 화면 부품(eXbuilder6 dateinput)에 직접 넣는다.
+    // 키보드로 넣으면 날짜칸 마스크가 '2.11.23.'·'1123.월.일.'처럼 깨지고, [조회]하면 오늘로 되돌아가
+    // '다른 날을 골랐는데 오늘 명단을 읽는' 일이 생겼다. (2026-11-24 실측)
+    setDate: function(v){
+      if(typeof cpr === 'undefined') return JSON.stringify({err: '나이스(eXbuilder) 화면이 아닙니다'});
+      var hit = null, alt = null;
+      cpr.core.Platform.INSTANCE.getAllRunningAppInstances().forEach(function(a){
+        try { a.getContainer().getAllRecursiveChildren().forEach(function(c){
+          if(c.type !== 'dateinput' || !c.visible) return;
+          if(String(c.format || '').toUpperCase() !== 'YYYYMMDD') return;
+          var r = c.getActualRect ? c.getActualRect() : null;
+          if(r && (r.width < 2 || r.height < 2)) return;      // 뒤에 숨은 다른 화면의 날짜칸
+          if(c.id === 'dtiAtteYmd') hit = hit || c; else alt = alt || c;
+        }); } catch(e) {}
+      });
+      hit = hit || alt;
+      if(!hit) return JSON.stringify({err: '날짜 입력칸(부품)을 못 찾았습니다'});
+      if(String(hit.value) === v) return JSON.stringify({ok: true, same: true});
+      try { hit.focus(); } catch(e) {}
+      hit.putValue(v);
+      return JSON.stringify({ok: String(hit.value) === v, value: hit.value});
+    },
+    // 일일출결관리 화면 요약: 제목(학년 반 날짜), ☞ 표시(일출결마감미확인/완료), 교시별 '미마감' 학생 수
+    info: function(){
+      var t = document.body.innerText || '';
+      var title = (t.match(/\d학년\s*\d+반\s*\d{4}\.\d{2}\.\d{2}\.?/) || [''])[0].replace(/\s+/g, ' ');
+      var marks = (t.match(/☞\s*\S+/g) || []).map(function(x){ return x.replace(/☞\s*/, ''); });
+      var tm = t.match(/Total\s*(\d+)/);
+      var h = header(), periods = [], n = 0;
+      if(h){
+        var d = data(h); n = d.length;
+        for(var c=0;c<h.cols.length;c++){
+          if(!/교시$/.test(h.cols[c])) continue;
+          var full = ((h.el.children[c].innerText || '')).replace(/\s+/g, ' ').trim();
+          var un = 0, seen = 0;
+          for(var i=0;i<d.length;i++){
+            var cell = d[i].cell(c); if(!cell) continue;
+            seen++; if(txt(cell) === '미마감') un++;
+          }
+          periods.push({col: h.cols[c], label: full, unclosed: un, seen: seen});
+        }
+      }
+      return JSON.stringify({title: title, marks: marks, total: tm ? +tm[1] : null,
+                             students: n, periods: periods, grid: !!h});
+    },
     // ── 읽기 ────────────────────────────────────────────────
     read: function(){
       var h = header();
@@ -1420,7 +1439,11 @@ def _att_open(port, match):
     if not pages:
         return None, "탭없음 — 나이스를 먼저 여세요"
     fallback, last_err = None, "화면 읽기 스크립트를 심지 못했습니다"
-    for page in pages:
+    # 화면이 다시 그려지는 순간엔 그리드가 잠깐 안 보인다 → 못 찾으면 잠깐 쉬고 한 바퀴 더 (2026-11-24)
+    for page in pages + [None] + pages:
+        if page is None:
+            time.sleep(1.0)
+            continue
         cdp = CDP(page["webSocketDebuggerUrl"])
         try:
             cdp.send("Page.enable")
@@ -1468,6 +1491,67 @@ def _click_at(cdp, pos, settle=0.45):
     time.sleep(settle)
 
 
+def _neis_close_notice(cdp):
+    """나이스 '알림'창(예: 「…시간표를 확인 하세요」)을 [확인]으로 닫는다. → (닫은 창 문구들, 남은 문구).
+       [취소]가 같이 있는 확인창(저장·조회 확인 등)은 선생님 입력이 날아갈 수 있어 건드리지 않는다."""
+    closed = []
+    for _ in range(4):
+        dlg = _sc(cdp, "dlg()")
+        if not dlg.get("open"):
+            return closed, ""
+        body = dlg.get("text") or ""
+        if "취소" in body or "저장" in body:
+            return closed, body
+        ok = _sc(cdp, "dlgBtnXY('확인')")
+        if ok.get("err"):
+            return closed, body
+        _click_at(cdp, ok, 0.7)
+        closed.append(body)
+    dlg = _sc(cdp, "dlg()")
+    return closed, (dlg.get("text") or "") if dlg.get("open") else ""
+
+
+NEIS_NODATA = "조회된 데이터가 없습니다 (휴업일·공휴일일 수 있음)"
+
+
+def _neis_goto_date(cdp, date8, wait=12):
+    """일일출결관리 화면의 날짜를 date8(YYYYMMDD)로 바꾸고 [조회]한다. 조회는 기록 변경이 아니다.
+       화면 제목('1학년 3반 2026.11.23.')이 그날로 바뀐 걸 확인해야 성공. → None 또는 안내 문구."""
+    want = "{}.{}.{}".format(date8[:4], date8[4:6], date8[6:])
+    said = "{}년 {}월 {}일".format(date8[:4], int(date8[4:6]), int(date8[6:]))   # 조회 때 뜨는 알림 문구
+    r = _sc(cdp, "setDate({})".format(_a(date8)))
+    if r.get("err"):
+        return r["err"] + " — '일일출결관리(담임용)' 화면인지 확인하세요"
+    time.sleep(0.6)
+    for _attempt in range(2):
+        _closed, left = _neis_close_notice(cdp)
+        if left:
+            return "나이스 확인창이 떠 있습니다 — 직접 처리해 주세요: 「{}」".format(left[:80])
+        seen = _sc(cdp, "dates()")
+        if isinstance(seen, list) and want not in seen:
+            return "날짜가 안 바뀌었습니다 — 화면: {} / 넣으려던 날: {}".format(", ".join(seen) or "?", want)
+        btn = _sc(cdp, "btnXY('조회')")
+        if btn.get("err"):
+            return btn["err"]
+        _click_at(cdp, btn, 0.5)
+        t0, asked = time.time(), False
+        # [조회]마다 「…일에 해당하는 시간표를 확인 하세요」 알림이 뜬다 — 닫고 계속 기다리면 표가 바뀐다.
+        # 수업 없는 날(휴업일 등)은 표가 비고 제목 날짜도 안 바뀐다 → 그날 알림을 본 뒤 'Total 0'이면 빈 날로 본다.
+        while time.time() - t0 < wait / 2.0:
+            closed, left = _neis_close_notice(cdp)
+            if left:
+                return "나이스 확인창이 떠 있습니다 — 직접 처리해 주세요: 「{}」".format(left[:80])
+            asked = asked or any(said in c for c in closed)
+            info = _sc(cdp, "info()")
+            if want in (info.get("title") or ""):
+                time.sleep(0.8)                         # 표가 다 그려질 시간
+                return None
+            if asked and info.get("total") == 0 and time.time() - t0 > 3.0:
+                return NEIS_NODATA
+            time.sleep(0.6)
+    return "조회한 화면이 {}로 바뀌지 않았습니다 — 나이스 화면을 확인하세요".format(want)
+
+
 def do_read_roster(port, match="sen.neis.go.kr"):
     """지금 떠 있는 출결 화면을 그대로 읽는다(변경 없음). (dict, status)."""
     cdp, st = _att_open(port, match)
@@ -1489,41 +1573,9 @@ def do_load_roster_by_date(port, date8, match="sen.neis.go.kr"):
     if not cdp:
         return None, st
     try:
-        pos = _sc(cdp, "dateXY()")
-        if pos.get("err"):
-            return None, pos["err"] + " — '일일출결관리(담임용)' 화면인지 확인하세요"
-        want = "{}.{}.{}".format(date8[:4], date8[4:6], date8[6:])
-        cdp.trusted_click(pos["x"], pos["y"])
-        time.sleep(0.3)
-        cdp.send("Input.dispatchKeyEvent", {"type": "keyDown", "modifiers": 2, "key": "a",
-                                            "code": "KeyA", "windowsVirtualKeyCode": 65})
-        cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", "modifiers": 2, "key": "a",
-                                            "code": "KeyA", "windowsVirtualKeyCode": 65})
-        cdp.send("Input.insertText", {"text": date8})
-        for t in ("keyDown", "keyUp"):
-            cdp.send("Input.dispatchKeyEvent", {"type": t, "key": "Tab", "code": "Tab",
-                                                "windowsVirtualKeyCode": 9})
-        time.sleep(0.4)
-
-        # 화면의 날짜칸을 '읽어서' 그날이 맞는지 본다.
-        # 엉뚱한 날짜 화면에 출결을 적는 것이 제일 나쁘다.
-        seen = _sc(cdp, "dates()")
-        if isinstance(seen, list) and seen and want not in seen:
-            return None, "날짜가 안 바뀌었습니다 — 화면: {} / 넣으려던 날: {}".format(", ".join(seen), want)
-
-        btn = _sc(cdp, "btnXY('조회')")
-        if not btn.get("err"):
-            _click_at(cdp, btn, 0.3)
-        # 날짜를 바꾸면 알림창이 뜨는 경우가 있다 — 남아 있으면 조회·저장 클릭을 막는다
-        dlg = _sc(cdp, "dlg()")
-        if dlg.get("open") and "저장하시겠습니까" not in (dlg.get("text") or ""):
-            ok = _sc(cdp, "dlgBtnXY('확인')")
-            if not ok.get("err"):
-                _click_at(cdp, ok, 0.4)
-                btn = _sc(cdp, "btnXY('조회')")
-                if not btn.get("err"):
-                    _click_at(cdp, btn, 0.3)
-        time.sleep(2.0)
+        err = _neis_goto_date(cdp, date8)
+        if err:
+            return None, err
 
         got = _sc(cdp, "read()")
         if got.get("err"):
@@ -1748,26 +1800,58 @@ def do_click_xy(port, match, x, y):
         cdp.close()
 
 
-def do_attendance_check(port, att):
-    """나이스 '출결 현황' 화면에서 학급별 마감/미마감 상태를 읽는다. (list, status)."""
-    match = att.get("match", "neis.go.kr")
-    page = find_target_page(port, match)
-    if not page:
-        return None, "탭없음"
-    ws_url = page.get("webSocketDebuggerUrl")
-    if not ws_url:
-        return None, "webSocket 주소 없음"
-    js = (ATTENDANCE_JS_TMPL
-          .replace("%CLASS_RE%", json.dumps(att.get("class_re", "(\\d학년\\s*\\d{1,2}반|\\d{1,2}\\s*-\\s*\\d{1,2})")))
-          .replace("%UNCLOSED%", json.dumps(att.get("unclosed_words", ["미마감"]), ensure_ascii=False))
-          .replace("%CLOSED%", json.dumps(att.get("closed_words", ["마감"]), ensure_ascii=False)))
-    cdp = CDP(ws_url)
+def school_days_back(n, today=None):
+    """오늘 포함 최근 평일 n일 (YYYYMMDD, 오래된 날 먼저)."""
+    d = today or datetime.now()
+    out = []
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y%m%d"))
+        d -= timedelta(days=1)
+    return out[::-1]
+
+
+def do_attendance_check(port, att, days):
+    """출결 미마감 점검 (2026-11-24 다시 만듦, 읽기만).
+       담임 권한에서 볼 수 있는 '일일출결관리' 화면을 날짜마다 [조회]해서
+         · ☞ 일출결마감미확인 / 일출결마감완료  (담임이 그날 [출결마감]을 눌렀는지)
+         · 교시 칸의 '미마감'                    (그 교시 교과 선생님이 아직 마감 안 함)
+       을 읽는다. 예전 판은 '학급별 마감현황' 화면을 전제로 했는데, 그 화면(반별일출결마감관리)은
+       교무권한이라 담임에겐 비어 있다. 끝나면 화면을 오늘 날짜로 돌려 둔다. → (list, status)"""
+    match = att.get("match", "sen.neis.go.kr")
+    cdp, st = _att_open(port, match)
+    if not cdp:
+        return None, st
+    today = datetime.now().strftime("%Y%m%d")
+    out = []
     try:
-        cdp.send("Page.enable")
-        cdp.send("Page.setWebLifecycleState", {"state": "active"})
-        return json.loads(cdp.eval_value(js) or "[]"), "ok"
+        if cdp.eval_value("__sc.hasGrid()") != "1":
+            return None, ("나이스 '학급담임 → 학적 → 출결관리 → 출결관리'(일일출결관리) 화면을 "
+                          "한 번 열어 주세요")
+        for d in days:
+            err = _neis_goto_date(cdp, d)
+            if err:
+                out.append({"date": d, "err": err})
+                if "확인창" in err or "화면인지" in err:
+                    break
+                continue
+            info = _sc(cdp, "info()")
+            # 가로로 가려진 교시(창이 좁을 때)는 화면을 잠깐 넓혀서 다시 읽는다
+            if any(p.get("seen", 0) < info.get("students", 0) for p in info.get("periods", [])):
+                try:
+                    cdp.send("Emulation.setDeviceMetricsOverride",
+                             {"width": 2400, "height": 1400, "deviceScaleFactor": 1, "mobile": False})
+                    time.sleep(1.5)
+                    info = _sc(cdp, "info()")
+                finally:
+                    cdp.send("Emulation.clearDeviceMetricsOverride", {})
+            info["date"] = d
+            out.append(info)
+        if days and days[-1] != today:
+            _neis_goto_date(cdp, today)
+        return out, "ok"
     except Exception as e:
-        return None, str(e)
+        return (out or None), str(e)
     finally:
         cdp.close()
 
@@ -3422,7 +3506,7 @@ class ConsoleApp:
         ttk.Button(top, text="① 기안한문서 읽기", command=self.gian_load).pack(side="left")
         ttk.Button(top, text="② 재작성 창 열기", command=self.gian_open).pack(side="left", padx=4)
         ttk.Button(top, text="열린 기안 창 읽기", command=self.gian_read_open).pack(side="left", padx=4)
-        self.gian_status = tk.StringVar(value="에듀파인 [기안한문서] 화면을 한 번 열어 둔 뒤 ①을 누르세요.")
+        self.gian_status = tk.StringVar(value="①을 누르면 에듀파인 [기안한문서] 화면을 알아서 열고 읽습니다 (에듀파인 로그인만 돼 있으면 됨).")
         ttk.Label(top, textvariable=self.gian_status, foreground="#8a4b14").pack(side="left", padx=10)
 
         pw = ttk.PanedWindow(frm, orient="horizontal")
@@ -4208,7 +4292,7 @@ class ConsoleApp:
         if not (HAS_WS and HAS_GIAN):
             messagebox.showerror("오류", "websocket-client와 comtypes가 필요합니다.")
             return
-        self.gian_status.set("기안한문서 읽는 중…")
+        self.gian_status.set("기안한문서 읽는 중… (화면이 안 열려 있으면 에듀파인에서 열고 있어요)")
 
         def work():
             try:
@@ -4824,7 +4908,7 @@ class ConsoleApp:
         frm = self.tab_query
         ttk.Label(frm, justify="left", foreground="#37597a", wraplength=940, text=(
             "조회 전용(읽기): 열려 있는 결재/문서 '목록 화면'을 읽어 표로 보여주고, 선택 항목을 클릭해 엽니다. "
-            "나이스 '출결 현황' 화면에서는 미마감 학급을 점검합니다. 입력·제출은 하지 않습니다.")
+            "아래 '출결 미마감 점검'은 나이스 일일출결관리 화면을 날짜별로 조회해 마감 여부를 봅니다. 입력·제출은 하지 않습니다.")
         ).pack(anchor="w", pady=(0, 8))
 
         # --- 결재·문서 목록 ---
@@ -4848,16 +4932,23 @@ class ConsoleApp:
         self.doclist_rows = {}   # iid → (match, x, y)
 
         # --- 출결 미마감 점검 ---
-        lf2 = ttk.LabelFrame(frm, text="출결 미마감 점검 (나이스 '출결 현황' 화면에서)", padding=8)
+        lf2 = ttk.LabelFrame(frm, text="출결 미마감 점검 (우리 반 · 나이스 일일출결관리 화면에서, 읽기만)", padding=8)
         lf2.pack(fill="x", pady=(10, 0))
+        ttk.Label(lf2, foreground="#555", justify="left", wraplength=940, text=(
+            "나이스 '학급담임 → 학적 → 출결관리 → 출결관리'(일일출결관리) 화면을 한 번 열어 두고 누르세요. "
+            "날짜마다 [조회]해서 ① 담임 [출결마감]을 눌렀는지(☞ 일출결마감완료/미확인) ② 아직 마감 안 한 교시(분홍 '미마감')를 봅니다. "
+            "점검이 끝나면 나이스 화면은 오늘 날짜로 돌아갑니다.")).pack(anchor="w")
         ctl2 = ttk.Frame(lf2)
-        ctl2.pack(fill="x")
-        ttk.Button(ctl2, text="출결 점검", command=self.attendance_check).pack(side="left", padx=3)
+        ctl2.pack(fill="x", pady=(6, 0))
+        ttk.Button(ctl2, text="오늘 점검", command=lambda: self.attendance_check(1)).pack(side="left", padx=3)
+        ttk.Button(ctl2, text="최근 5일 점검", command=lambda: self.attendance_check(5)).pack(side="left", padx=3)
         ttk.Label(ctl2, text="마감 기준시각").pack(side="left", padx=(10, 2))
         self.att_deadline = tk.StringVar(value=self.cfg.get("attendance", {}).get("deadline", "15:00"))
         ttk.Entry(ctl2, textvariable=self.att_deadline, width=8).pack(side="left")
+        ttk.Label(ctl2, text="(이 시각이 지났는데 오늘 마감 전이면 알림)", foreground="#888").pack(side="left", padx=6)
         self.att_result = tk.StringVar(value="아직 점검 안 함")
-        ttk.Label(lf2, textvariable=self.att_result, justify="left", wraplength=940).pack(anchor="w", pady=(8, 0))
+        ttk.Label(lf2, textvariable=self.att_result, justify="left", wraplength=940,
+                  font=("맑은 고딕", 10)).pack(anchor="w", pady=(8, 0))
 
     def _build_perf(self):
         """'나이스 업무 → 수행평가 누락 확인' (예전엔 조회 대시보드 아래에 있었음)."""
@@ -6436,16 +6527,20 @@ class ConsoleApp:
                 datetime.now().strftime("%H:%M:%S"), "성공" if ok else "실패", x, y, status))
         threading.Thread(target=work, daemon=True).start()
 
-    def attendance_check(self):
+    def attendance_check(self, ndays=1):
         if not HAS_WS:
             messagebox.showerror("오류", "websocket-client가 필요합니다.")
             return
         att = dict(self.cfg.get("attendance", {}))
         att["deadline"] = self.att_deadline.get().strip() or att.get("deadline", "15:00")
-        self.att_result.set("점검 중…")
+        days = school_days_back(ndays)
+        self.att_result.set("점검 중… ({}일, 날짜마다 나이스에서 조회 — 하루 3~5초)".format(len(days)))
 
         def work():
-            data, status = do_attendance_check(self._port(), att)
+            try:
+                data, status = do_attendance_check(self._port(), att, days)
+            except Exception as e:
+                data, status = None, str(e)
             self.ui_post("attendance", {"data": data, "status": status, "deadline": att["deadline"]})
         threading.Thread(target=work, daemon=True).start()
 
@@ -6468,19 +6563,43 @@ class ConsoleApp:
 
     def _show_attendance(self, payload):
         data = payload["data"]
-        if data is None:
-            self.att_result.set("결과 없음 ({}). 나이스 '출결 현황' 화면을 연 상태인지 확인하세요.".format(payload["status"]))
-            return
         if not data:
-            self.att_result.set("학급/마감 표시를 찾지 못했습니다. (출결 현황 화면 용어에 맞게 설정에서 패턴 조정)")
+            self.att_result.set("점검 못 함 — {}".format(payload["status"]))
             return
-        unclosed = [d["cls"] for d in data if d.get("status") == "미마감"]
-        closed = [d["cls"] for d in data if d.get("status") == "마감"]
-        msg = "미마감 {}개: {}   |   마감 {}개".format(len(unclosed), ", ".join(unclosed) or "없음", len(closed))
-        self.att_result.set(msg)
-        self.log("[{}] 출결 점검 — {}".format(datetime.now().strftime("%H:%M:%S"), msg))
-        if unclosed and datetime.now().strftime("%H:%M") >= payload.get("deadline", "15:00"):
-            toast("출결 미마감", "기준시각 지남 — 미마감 학급: {}".format(", ".join(unclosed)))
+        wk = "월화수목금토일"
+        today = datetime.now().strftime("%Y%m%d")
+        lines, open_days, today_open = [], [], False
+        for d in data:
+            dd = d.get("date", "")
+            day = "{}.{}({})".format(int(dd[4:6]), int(dd[6:]), wk[datetime.strptime(dd, "%Y%m%d").weekday()]) if dd else "?"
+            if d.get("err"):
+                lines.append("{}  —  {}".format(day, d["err"]))
+                continue
+            marks = d.get("marks") or []
+            done = any("일출결마감완료" in m for m in marks)
+            month = [m for m in marks if re.match(r"\d+월출결마감완료", m)]
+            per = [p for p in d.get("periods", []) if p.get("unclosed")]
+            head = "{}  {}  —  ".format(day, re.sub(r"\s*\d{4}\.\d{2}\.\d{2}\.?$", "", d.get("title", "")))
+            if done:
+                msg = "✓ 담임 출결마감 완료" + (" (" + ", ".join(month) + ")" if month else "")
+            else:
+                msg = "✗ 담임 출결마감 전 (☞ 일출결마감미확인)"
+                open_days.append(day)
+                if dd == today:
+                    today_open = True
+            if per:
+                if len(per) == len(d.get("periods", [])):
+                    msg += "  ·  교과 미마감: 모든 교시({}개)".format(len(per))
+                else:
+                    msg += "  ·  교과 미마감: " + ", ".join(p.get("label") or p.get("col") for p in per)
+            lines.append(head + msg)
+        if payload["status"] != "ok":
+            lines.append("⚠ 중간에 멈춤: " + payload["status"])
+        summary = ("마감 안 한 날: " + ", ".join(open_days)) if open_days else "점검한 날은 모두 마감됨"
+        self.att_result.set("\n".join(lines + ["", summary]))
+        self.log("[{}] 출결 점검 — {}".format(datetime.now().strftime("%H:%M:%S"), summary))
+        if today_open and datetime.now().strftime("%H:%M") >= payload.get("deadline", "15:00"):
+            toast("출결 미마감", "기준시각이 지났는데 오늘 출결마감 전입니다")
 
     def perf_check(self):
         if not HAS_WS:

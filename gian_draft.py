@@ -95,6 +95,48 @@ OPEN_JS_TMPL = "(function(){" + _FIND_FRAME_JS + r"""
 })()"""
 
 
+# [기안한문서] 화면이 안 열려 있으면 에듀파인 메뉴를 코드로 연다 (메뉴 클릭과 같은 gfnOpenMenu, 읽기 화면이라 안전).
+#  메뉴 ID는 학교마다 다를 수 있어서 메뉴 목록(gdsMenu)에서 화면 주소로 찾는다.
+DRFT_STATE_JS = "(function(){" + _FIND_FRAME_JS + r"""
+  var w=__gdFrame(); if(!w) return 'none';
+  try { var d=w.document; if(d.readyState!=='complete') return 'loading';
+        if(d.forms[0] && d.forms[0].docinfo) return 'ready';
+        if(/총\s*\d+\s*건/.test(d.body.innerText||'')) return 'ready'; } catch(e){ return 'loading'; }
+  return 'loading';
+})()"""
+
+DRFT_OPEN_MENU_JS = r"""(function(){
+  try { var a=nexacro.getApplication(); var ds=a.gdsMenu; ds.filter('');
+    var col=a.gv_progrmCoursAdresCol||'progrmCoursAdres', id=null;
+    for(var r=0;r<ds.getRowCount();r++){ var u=ds.getColumn(r,col)||'';
+      if(/\/retrieveDrftComptDocList\.do$/.test(u)){ id=ds.getColumn(r,a.gv_menuIdCol||'menuId'); break; } }
+    if(!id) return 'nomenu';
+    a.mainframe.MainVFrameSet.TopFrame.form.gfnOpenMenu(id);
+    return 'ok';
+  } catch(e){ return 'err ' + e; }
+})()"""
+
+
+def ensure_drafted_frame(cdp, timeout=20):
+    """기안한문서 화면이 없으면 메뉴로 열고 목록이 뜰 때까지 기다린다. → None(준비됨) 또는 안내 문구."""
+    st = cdp.eval_value(DRFT_STATE_JS)
+    if st == "ready":
+        return None
+    if st == "none":
+        r = cdp.eval_value(DRFT_OPEN_MENU_JS) or "?"
+        if r != "ok":
+            return ("에듀파인 메뉴에서 [기안한문서]를 못 찾았습니다 — 로그인 상태를 확인하거나 "
+                    "[문서관리 > 내문서함 > 기안한문서]를 직접 열어 주세요 ({})".format(r))
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(0.7)
+        if cdp.eval_value(DRFT_STATE_JS) == "ready":
+            time.sleep(0.5)
+            return None
+    return ("[기안한문서] 화면이 {}초 안에 뜨지 않았습니다 — 에듀파인 창(열린 화면 개수 제한 안내 등)을 "
+            "확인해 주세요".format(timeout))
+
+
 def _edufine_cdp(port, find_target_page, CDP):
     page = find_target_page(port, EDUFINE_MATCH)
     if not page or not page.get("webSocketDebuggerUrl"):
@@ -109,11 +151,14 @@ def read_drafted_list(port, find_target_page, CDP):
         return None, "K-에듀파인 탭이 없습니다 (디버그 크롬에서 에듀파인 로그인 필요)"
     try:
         cdp.send("Page.setWebLifecycleState", {"state": "active"})
+        why = ensure_drafted_frame(cdp)
+        if why:
+            return None, why
         res = json.loads(cdp.eval_value(LIST_JS) or "{}")
     finally:
         cdp.close()
     if res.get("err") == "noframe":
-        return None, "에듀파인에서 [문서관리 > 내문서함 > 기안한문서] 화면을 한 번 열어 주세요"
+        return None, "[기안한문서] 화면을 열지 못했습니다 — 에듀파인에서 [문서관리 > 내문서함 > 기안한문서]를 직접 열어 주세요"
     if res.get("err"):
         return None, "기안한문서 목록을 못 읽음 ({})".format(res["err"])
     return res.get("rows", []), "ok (화면 {}건 / 전체 {}건)".format(len(res.get("rows", [])), res.get("total") or "?")
@@ -126,6 +171,8 @@ def open_redraft(port, docno, find_target_page, CDP):
         return "K-에듀파인 탭 없음"
     try:
         cdp.send("Page.setWebLifecycleState", {"state": "active"})
+        if ensure_drafted_frame(cdp):
+            return "noframe"
         return cdp.eval_value(OPEN_JS_TMPL.replace("%DOCNO%", json.dumps(docno, ensure_ascii=False))) or "?"
     finally:
         cdp.close()
@@ -888,6 +935,9 @@ def read_doc_meta(port, find_target_page, CDP, with_body=False, progress=None):
     bodies, nb = {}, 0
     try:
         cdp.send("Page.setWebLifecycleState", {"state": "active"})
+        why = ensure_drafted_frame(cdp)
+        if why:
+            return None, why
         res = _jl(cdp.eval_value(META_JS), {})
         if with_body and isinstance(res, dict) and not res.get("err"):
             todo = [r for r in res.get("rows", []) if r.get("id")]
